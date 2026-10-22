@@ -577,6 +577,10 @@ function renderSession() {
     const x = Date.parse(r.ts);
     for (const [k] of COMPONENTS) { running[k] += r.cost[k]; series[k].push({ x, y: running[k] }); }
   }
+  // Cost reported after the last request is from calls the transcript doesn't log (recaps, prompt suggestions).
+  if (reqs.length && Date.parse(reqs.at(-1).ts) < timeAxis.max) {
+    for (const [k] of COMPONENTS) series[k].push({ x: timeAxis.max, y: running[k] });
+  }
   const comps = COMPONENTS.map((c, i) => [...c, i]).filter(([k]) => running[k] > 0 || k !== 'web_search');
   const datasets = comps.map(([k, label, i], n) => lineDS(label, series[k], P.s[i], {
     fill: n === 0 ? 'origin' : '-1', backgroundColor: P.s[i], borderColor: P.s[i], borderWidth: 0, stack: 'est', pointHoverRadius: 0, stepped: 'before',
