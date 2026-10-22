@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Claude Code usage tracker -> ~/.claude/usage/usage.db (SQLite).
+
+  track.py record     # stdin = statusline JSON; called by statusline-wrapper.sh on every statusline refresh
+  track.py line       # stdin = statusline JSON; print a minimal status line (used when no other statusline is set)
+  track.py backfill   # ingest token usage from every transcript still on disk (no cost: transcripts don't carry it)
+  track.py stats      # print a summary
+  track.py day [DATE] # sessions billed on one local day (YYYY-MM-DD, default today)
+
+Cost comes from Claude Code itself (statusline cost.total_cost_usd). Per-request token
+usage comes from the session transcript (+ subagent transcripts), deduped by requestId.
+"""
+import glob
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+DB = os.path.join(CLAUDE_DIR, "usage", "usage.db")
+STATE = os.path.join(CLAUDE_DIR, "usage", "state")  # last seen raw cost per session
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id     TEXT PRIMARY KEY,
+    cwd            TEXT,
+    model          TEXT,
+    version        TEXT,
+    cost_usd       REAL,     -- session total (survives cost counter resets on resume)
+    cost_raw_last  REAL,     -- last raw cost.total_cost_usd seen
+    cost_base      REAL DEFAULT 0,
+    duration_ms    INTEGER,
+    api_duration_ms INTEGER,
+    lines_added    INTEGER,
+    lines_removed  INTEGER,
+    first_seen     TEXT,     -- first time the statusline saw a non-zero cost
+    last_seen      TEXT      -- last time the statusline saw the cost change
+);
+CREATE TABLE IF NOT EXISTS cost_events (
+    session_id TEXT,
+    ts         TEXT,
+    cost_usd   REAL,         -- cumulative session cost at ts
+    delta_usd  REAL          -- cost added since the previous event
+);
+CREATE INDEX IF NOT EXISTS cost_events_ts ON cost_events(ts);
+CREATE TABLE IF NOT EXISTS requests (
+    request_id     TEXT PRIMARY KEY,
+    session_id     TEXT,
+    agent_id       TEXT,     -- NULL for the main thread, else the subagent id
+    ts             TEXT,
+    cwd            TEXT,
+    model          TEXT,
+    input_tokens   INTEGER,
+    cache_write_5m INTEGER,
+    cache_write_1h INTEGER,
+    cache_read     INTEGER,
+    output_tokens  INTEGER,
+    thinking_tokens INTEGER,
+    web_searches   INTEGER,
+    web_fetches    INTEGER,
+    speed          TEXT,
+    service_tier   TEXT
+);
+CREATE INDEX IF NOT EXISTS requests_session ON requests(session_id);
+CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
+CREATE TABLE IF NOT EXISTS ingested_files (
+    path   TEXT PRIMARY KEY,
+    offset INTEGER
+);
+DROP VIEW IF EXISTS session_stats;
+CREATE VIEW session_stats AS
+SELECT ids.session_id,
+       COALESCE(s.cwd, r.cwd)          AS cwd,
+       COALESCE(s.model, r.model)      AS model,
+       s.cost_usd,
+       COALESCE(r.first_request, s.first_seen) AS first_request,
+       COALESCE(r.last_request,  s.last_seen)  AS last_request,
+       r.requests, r.subagent_requests,
+       r.input_tokens, r.cache_write_5m, r.cache_write_1h, r.cache_read,
+       r.output_tokens, r.thinking_tokens,
+       s.duration_ms, s.api_duration_ms, s.lines_added, s.lines_removed
+FROM (SELECT session_id FROM sessions UNION SELECT session_id FROM requests) ids
+LEFT JOIN sessions s USING (session_id)
+LEFT JOIN (
+    SELECT session_id,
+           (SELECT cwd FROM requests r1 WHERE r1.session_id = requests.session_id AND agent_id IS NULL ORDER BY ts LIMIT 1) AS cwd,
+           (SELECT model FROM requests r1 WHERE r1.session_id = requests.session_id AND agent_id IS NULL ORDER BY ts DESC LIMIT 1) AS model,
+           MIN(ts) AS first_request, MAX(ts) AS last_request,
+           COUNT(*) AS requests, COUNT(agent_id) AS subagent_requests,
+           SUM(input_tokens) AS input_tokens, SUM(cache_write_5m) AS cache_write_5m,
+           SUM(cache_write_1h) AS cache_write_1h, SUM(cache_read) AS cache_read,
+           SUM(output_tokens) AS output_tokens, SUM(thinking_tokens) AS thinking_tokens
+    FROM requests GROUP BY session_id
+) r USING (session_id);
+"""
+
+
+def connect():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    db = sqlite3.connect(DB, timeout=15)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
+    return db
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def ingest_file(db, path, agent_id=None):
+    """Read new complete lines of a transcript since the last ingest and upsert its requests."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    row = db.execute("SELECT offset FROM ingested_files WHERE path = ?", (path,)).fetchone()
+    offset = row[0] if row and row[0] <= size else 0
+    if offset == size:
+        return
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    end = data.rfind(b"\n") + 1  # leave a partially written last line for next time
+    rows = []
+    for line in data[:end].splitlines():
+        if b'"usage"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        msg = e.get("message") or {}
+        u = msg.get("usage")
+        rid = e.get("requestId")
+        if e.get("type") != "assistant" or not u or not rid:
+            continue
+        cc = u.get("cache_creation") or {}
+        cw_total = u.get("cache_creation_input_tokens") or 0
+        cw_1h = cc.get("ephemeral_1h_input_tokens") or 0
+        cw_5m = cc.get("ephemeral_5m_input_tokens", cw_total - cw_1h) or 0
+        stu = u.get("server_tool_use") or {}
+        rows.append((
+            rid, e.get("sessionId"), agent_id, e.get("timestamp"), e.get("cwd"), msg.get("model"),
+            u.get("input_tokens") or 0, cw_5m, cw_1h, u.get("cache_read_input_tokens") or 0,
+            u.get("output_tokens") or 0, (u.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
+            stu.get("web_search_requests") or 0, stu.get("web_fetch_requests") or 0,
+            u.get("speed"), u.get("service_tier"),
+        ))
+    # A request is logged once per content block; later entries carry the final usage, so REPLACE keeps the last.
+    db.executemany("INSERT OR REPLACE INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.execute("INSERT OR REPLACE INTO ingested_files VALUES (?, ?)", (path, offset + end))
+
+
+def ingest_session(db, transcript_path):
+    ingest_file(db, transcript_path)
+    for sub in glob.glob(os.path.join(transcript_path[:-len(".jsonl")], "subagents", "*.jsonl")):
+        ingest_file(db, sub, os.path.basename(sub)[:-len(".jsonl")])
+
+
+def record():
+    d = json.load(sys.stdin)
+    sid = d.get("session_id")
+    if not sid:
+        return
+    cost = d.get("cost") or {}
+    raw = float(cost.get("total_cost_usd") or 0)
+    # The statusline refreshes far more often than requests happen: only touch the DB when the cost changed.
+    state = os.path.join(STATE, os.path.basename(sid))
+    try:
+        with open(state) as f:
+            if f.read().strip() == repr(raw):
+                return
+    except OSError:
+        pass
+    os.makedirs(STATE, exist_ok=True)
+    with open(state, "w") as f:
+        f.write(repr(raw))
+    ts = now_iso()
+    db = connect()
+    with db:
+        prev = db.execute("SELECT cost_raw_last, cost_base, cost_usd FROM sessions WHERE session_id = ?", (sid,)).fetchone()
+        raw_last, base, total_prev = prev if prev else (0.0, 0.0, 0.0)
+        raw_last, base, total_prev = raw_last or 0.0, base or 0.0, total_prev or 0.0
+        if raw < raw_last:  # counter restarted (e.g. resumed in a new process): keep what was already spent
+            base += raw_last
+        total = base + raw
+        changed = total > total_prev + 1e-9
+        db.execute("""
+            INSERT INTO sessions (session_id, cwd, model, version, cost_usd, cost_raw_last, cost_base,
+                                  duration_ms, api_duration_ms, lines_added, lines_removed, first_seen, last_seen)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                cwd = excluded.cwd, model = excluded.model, version = excluded.version,
+                cost_usd = excluded.cost_usd, cost_raw_last = excluded.cost_raw_last, cost_base = excluded.cost_base,
+                duration_ms = excluded.duration_ms, api_duration_ms = excluded.api_duration_ms,
+                lines_added = excluded.lines_added, lines_removed = excluded.lines_removed,
+                first_seen = COALESCE(sessions.first_seen, excluded.first_seen),
+                last_seen = CASE WHEN ? THEN excluded.last_seen ELSE sessions.last_seen END
+            """, (sid, (d.get("workspace") or {}).get("project_dir") or d.get("cwd"),
+                  (d.get("model") or {}).get("id"), d.get("version"), total, raw, base,
+                  cost.get("total_duration_ms"), cost.get("total_api_duration_ms"),
+                  cost.get("total_lines_added"), cost.get("total_lines_removed"),
+                  ts if total > 0 else None, ts if total > 0 else None, changed))
+        if changed:
+            db.execute("INSERT INTO cost_events VALUES (?,?,?,?)", (sid, ts, total, total - total_prev))
+        tp = d.get("transcript_path")
+        if tp and tp.endswith(".jsonl"):
+            ingest_session(db, tp)
+
+
+def backfill():
+    db = connect()
+    paths = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+    for p in paths:
+        with db:
+            ingest_session(db, p)
+    n = db.execute("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM requests").fetchone()
+    print(f"ingested {len(paths)} transcripts: {n[0]} requests across {n[1]} sessions")
+
+
+def show(db, title, sql, params=()):
+    cur = db.execute(sql, params)
+    cols = [c[0] for c in cur.description]
+    rows = [[("" if v is None else f"{v:,.2f}" if isinstance(v, float) else f"{v:,}" if isinstance(v, int) else str(v)) for v in r] for r in cur]
+    w = [max([len(c)] + [len(r[i]) for r in rows]) for i, c in enumerate(cols)]
+    print(f"\n== {title}")
+    print("  ".join(c.ljust(w[i]) for i, c in enumerate(cols)))
+    for r in rows:
+        print("  ".join(v.rjust(w[i]) if i else v.ljust(w[i]) for i, v in enumerate(r)))
+
+
+# Cost billed per (session, local day) from cost_events, joined with the tokens of that session's requests on that day.
+SESSION_DAYS = """
+WITH c AS (
+    SELECT session_id, date(ts, 'localtime') AS day, SUM(delta_usd) AS cost_usd FROM cost_events GROUP BY 1, 2
+), t AS (
+    SELECT session_id, date(ts, 'localtime') AS day, COUNT(*) AS requests,
+           time(MIN(ts), 'localtime') AS first, time(MAX(ts), 'localtime') AS last,
+           SUM(input_tokens) AS input, SUM(cache_write_5m + cache_write_1h) AS cache_write,
+           SUM(cache_read) AS cache_read, SUM(output_tokens) AS output
+    FROM requests GROUP BY 1, 2
+)
+SELECT day, substr(session_id, 1, 8) AS session,
+       replace(st.cwd, rtrim(st.cwd, replace(st.cwd, '/', '')), '') AS project,
+       c.cost_usd, st.cost_usd AS session_total, t.requests, t.first, t.last,
+       t.input, t.cache_write, t.cache_read, t.output
+FROM c LEFT JOIN t USING (session_id, day) JOIN session_stats st USING (session_id)
+"""
+
+
+def day():
+    """Sessions billed on one local day (default today): track.py day [YYYY-MM-DD]"""
+    db = connect()
+    d = sys.argv[2] if len(sys.argv) > 2 else datetime.now().strftime("%Y-%m-%d")
+    show(db, f"Billed on {d}", SESSION_DAYS + " WHERE day = ? ORDER BY c.cost_usd DESC", (d,))
+    show(db, "Total", "SELECT SUM(delta_usd) AS cost_usd, COUNT(DISTINCT session_id) AS sessions "
+         "FROM cost_events WHERE date(ts, 'localtime') = ?", (d,))
+
+
+def stats():
+    db = connect()
+    show = lambda title, sql: globals()["show"](db, title, sql)
+    show("All time", """SELECT COUNT(*) AS sessions, COUNT(cost_usd) AS with_cost, SUM(cost_usd) AS cost_usd,
+        SUM(requests) AS requests, SUM(input_tokens) AS input, SUM(cache_write_5m + cache_write_1h) AS cache_write,
+        SUM(cache_read) AS cache_read, SUM(output_tokens) AS output FROM session_stats""")
+    show("Cost by day (last 14)", """SELECT date(ts, 'localtime') AS day, SUM(delta_usd) AS cost_usd,
+        COUNT(DISTINCT session_id) AS sessions FROM cost_events GROUP BY day ORDER BY day DESC LIMIT 14""")
+    show("Cost by session per day (last 7 days)", SESSION_DAYS +
+         " WHERE day >= date('now', 'localtime', '-6 days') ORDER BY day DESC, c.cost_usd DESC")
+    show("By project", """SELECT replace(cwd, rtrim(cwd, replace(cwd, '/', '')), '') AS project, COUNT(*) AS sessions,
+        SUM(cost_usd) AS cost_usd, SUM(requests) AS requests, SUM(output_tokens) AS output
+        FROM session_stats GROUP BY project ORDER BY cost_usd DESC NULLS LAST, requests DESC""")
+    show("Recent sessions", """SELECT substr(session_id, 1, 8) AS session,
+        replace(cwd, rtrim(cwd, replace(cwd, '/', '')), '') AS project, model, cost_usd,
+        datetime(first_request, 'localtime') AS first_request, datetime(last_request, 'localtime') AS last_request,
+        requests, output_tokens AS output FROM session_stats ORDER BY last_request DESC LIMIT 15""")
+
+
+def line():
+    """Minimal status line: [model] $cost · context %."""
+    d = json.load(sys.stdin)
+    model = (d.get("model") or {}).get("display_name") or "Claude"
+    cost = float((d.get("cost") or {}).get("total_cost_usd") or 0)
+    pct = (d.get("context_window") or {}).get("used_percentage")
+    print(f"[{model}] ${cost:.2f}" + (f" · {pct:.0f}% ctx" if isinstance(pct, (int, float)) else ""))
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "stats"
+    {"record": record, "line": line, "backfill": backfill, "stats": stats, "day": day}[cmd]()

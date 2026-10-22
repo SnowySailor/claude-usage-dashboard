@@ -7,7 +7,7 @@ services:
     volumes:
       # Not :ro - usage.db is in WAL mode, and even a read-only reader must update usage.db-shm.
       # The app itself only opens the database with a read-only connection (mode=ro, query_only).
-      - ${HOME}/.claude/usage:/data
+      - ${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/usage:/data
       # Live-mount the app so pricing.json / frontend edits apply without a rebuild.
       - ./app:/app:ro
     restart: unless-stopped
