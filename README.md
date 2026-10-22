@@ -82,7 +82,7 @@ python3 tracker/track.py backfill       # re-import token usage from transcripts
 
 - **Prices:** edit `app/pricing.json` (USD per million tokens). The dashboard reloads it automatically.
 - **Port:** change `127.0.0.1:10001` in `docker-compose.yml`.
-- **Auto-compact line:** the context chart marks 350K. Change `AUTO_COMPACT` in `app/static/app.js` to match your setting.
+- **Auto-compact line:** the context charts mark each session's auto-compact window, which the tracker records from `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else `autoCompactWindow` (per model under `modelSettings`, where `/autocompact` saves it) in your managed, project, and user settings, else the model's context window. The daily chart uses the most recent session's window. The tracker can't see a window passed with `--autocompact`.
 - **Config directory:** `CLAUDE_CONFIG_DIR` is respected by the installer, the tracker, and the Docker mount.
 
 `app/` is mounted into the container, so frontend and pricing edits apply on reload. Changes to `server.py` need `docker compose restart`.

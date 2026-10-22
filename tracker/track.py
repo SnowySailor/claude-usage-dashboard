@@ -13,6 +13,7 @@ usage comes from the session transcript (+ subagent transcripts), deduped by req
 import glob
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claud
 DB = os.path.join(CLAUDE_DIR, "usage", "usage.db")
 STATE = os.path.join(CLAUDE_DIR, "usage", "state")  # last seen raw cost per session
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json",
+                    "/etc/claude-code/managed-settings.json")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -36,7 +39,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     lines_added    INTEGER,
     lines_removed  INTEGER,
     first_seen     TEXT,     -- first time the statusline saw a non-zero cost
-    last_seen      TEXT      -- last time the statusline saw the cost change
+    last_seen      TEXT,     -- last time the statusline saw the cost change
+    compact_window INTEGER   -- auto-compact window in effect, in tokens
 );
 CREATE TABLE IF NOT EXISTS cost_events (
     session_id TEXT,
@@ -80,7 +84,7 @@ SELECT ids.session_id,
        r.requests, r.subagent_requests,
        r.input_tokens, r.cache_write_5m, r.cache_write_1h, r.cache_read,
        r.output_tokens, r.thinking_tokens,
-       s.duration_ms, s.api_duration_ms, s.lines_added, s.lines_removed
+       s.duration_ms, s.api_duration_ms, s.lines_added, s.lines_removed, s.compact_window
 FROM (SELECT session_id FROM sessions UNION SELECT session_id FROM requests) ids
 LEFT JOIN sessions s USING (session_id)
 LEFT JOIN (
@@ -101,7 +105,11 @@ def connect():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     db = sqlite3.connect(DB, timeout=15)
     db.execute("PRAGMA journal_mode=WAL")
-    db.executescript(SCHEMA)
+    # IMMEDIATE: concurrent statusline refreshes otherwise race to drop and recreate the view.
+    db.executescript("BEGIN IMMEDIATE;" + SCHEMA)
+    if "compact_window" not in {c[1] for c in db.execute("PRAGMA table_info(sessions)")}:
+        db.execute("ALTER TABLE sessions ADD COLUMN compact_window INTEGER")
+    db.commit()
     return db
 
 
@@ -159,6 +167,49 @@ def ingest_session(db, transcript_path):
         ingest_file(db, sub, os.path.basename(sub)[:-len(".jsonl")])
 
 
+def window_tokens(v):
+    """Tokens from an auto-compact window value (200000, "200k", "1M"), or None if invalid or out of range."""
+    if isinstance(v, str):
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", v.strip())
+        v = float(m[1]) * {"": 1, "k": 1e3, "m": 1e6}[m[2].lower()] if m else None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return int(v) if 100_000 <= v <= 1_000_000 else None
+
+
+def settings_window(d):
+    """modelSettings.<model>.autoCompactWindow, else autoCompactWindow, from the highest-precedence settings file
+    that sets either. None for "auto"."""
+    norm = lambda m: (m or "").lower().removesuffix("[1m]")
+    model = norm((d.get("model") or {}).get("id"))
+    project = (d.get("workspace") or {}).get("project_dir") or d.get("cwd")
+    project_files = (os.path.join(project, ".claude", "settings.local.json"),
+                     os.path.join(project, ".claude", "settings.json")) if project else ()
+    for path in MANAGED_SETTINGS + project_files + (os.path.join(CLAUDE_DIR, "settings.json"),):
+        try:
+            with open(path) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(s, dict):
+            continue
+        per_model = {norm(k): v for k, v in (s.get("modelSettings") or {}).items() if isinstance(v, dict)}
+        for v in ((per_model.get(model) or {}).get("autoCompactWindow"), s.get("autoCompactWindow")):
+            if v == "auto":
+                return None
+            if window_tokens(v):
+                return window_tokens(v)
+    return None
+
+
+def compact_window(d):
+    """Auto-compact window for the session, resolved like Claude Code does, capped at the model's context window.
+    A window passed with --autocompact isn't visible here."""
+    size = (d.get("context_window") or {}).get("context_window_size")
+    window = window_tokens(os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")) or settings_window(d)
+    return min(window, size) if window and size else window or size
+
+
 def record():
     d = json.load(sys.stdin)
     sid = d.get("session_id")
@@ -189,20 +240,22 @@ def record():
         changed = total > total_prev + 1e-9
         db.execute("""
             INSERT INTO sessions (session_id, cwd, model, version, cost_usd, cost_raw_last, cost_base,
-                                  duration_ms, api_duration_ms, lines_added, lines_removed, first_seen, last_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  duration_ms, api_duration_ms, lines_added, lines_removed, first_seen, last_seen,
+                                  compact_window)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(session_id) DO UPDATE SET
                 cwd = excluded.cwd, model = excluded.model, version = excluded.version,
                 cost_usd = excluded.cost_usd, cost_raw_last = excluded.cost_raw_last, cost_base = excluded.cost_base,
                 duration_ms = excluded.duration_ms, api_duration_ms = excluded.api_duration_ms,
                 lines_added = excluded.lines_added, lines_removed = excluded.lines_removed,
+                compact_window = excluded.compact_window,
                 first_seen = COALESCE(sessions.first_seen, excluded.first_seen),
                 last_seen = CASE WHEN ? THEN excluded.last_seen ELSE sessions.last_seen END
             """, (sid, (d.get("workspace") or {}).get("project_dir") or d.get("cwd"),
                   (d.get("model") or {}).get("id"), d.get("version"), total, raw, base,
                   cost.get("total_duration_ms"), cost.get("total_api_duration_ms"),
                   cost.get("total_lines_added"), cost.get("total_lines_removed"),
-                  ts if total > 0 else None, ts if total > 0 else None, changed))
+                  ts if total > 0 else None, ts if total > 0 else None, compact_window(d), changed))
         if changed:
             db.execute("INSERT INTO cost_events VALUES (?,?,?,?)", (sid, ts, total, total - total_prev))
         tp = d.get("transcript_path")

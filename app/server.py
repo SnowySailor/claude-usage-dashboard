@@ -170,10 +170,13 @@ def dashboard(q):
                        (lo, lo, hi, lo)).fetchall() if lo else [],
             dict(db.execute("SELECT session_id, MIN(ts) FROM cost_events GROUP BY session_id").fetchall()),
             dict(db.execute("SELECT session_id, MIN(ts) FROM requests GROUP BY session_id").fetchall()),
+            db.execute("SELECT compact_window FROM sessions WHERE compact_window IS NOT NULL "
+                       "AND (? IS NULL OR replace(model, '[1m]', '') = ?) ORDER BY last_seen DESC LIMIT 1",
+                       (model, model)).fetchone(),
         )
 
     (sessions, reqs, events, (data_min, data_max), tracked_since, models, pre_range,
-     first_event, first_request) = read(load)
+     first_event, first_request, latest_window) = read(load)
     proj = {sid: project_name(s["cwd"]) for sid, s in sessions.items()}
     local_day = lambda ts: parse_ts(ts).astimezone(tz).date()
 
@@ -314,6 +317,7 @@ def dashboard(q):
             "models": models,
             "data_min": data_min, "data_max": data_max, "tracked_since": tracked_since,
             "show_actual": show_actual, "tracked_only": tracked_only, "split": split,
+            "compact_window": latest_window[0] if latest_window else None,
         },
         "kpis": {
             "est": est_total, "actual": total["actual"] if show_actual else None,

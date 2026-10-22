@@ -1,6 +1,5 @@
 'use strict';
 
-const AUTO_COMPACT = 350_000; // modelSettings.autoCompactWindow in ~/.claude/settings.json
 const REFRESH_MS = 30_000;
 // Fixed categorical slot per billing component (index into --s1..--s8). Order = stack order.
 const COMPONENTS = [
@@ -426,6 +425,7 @@ function renderTokens(d) {
 
 function renderContext(d) {
   const max = Math.max(0, ...d.daily.map((x) => x.ctx_max || 0));
+  const win = d.meta.compact_window;
   draw('c-context', {
     type: 'line',
     data: {
@@ -436,9 +436,9 @@ function renderContext(d) {
       ],
     },
     options: options({
-      y: { suggestedMax: Math.max(max, AUTO_COMPACT) * 1.08 },
+      y: { suggestedMax: Math.max(max, win) * 1.08 },
       tip: { callbacks: { label: (c) => ` ${c.dataset.label}: ${int(c.parsed.y)} tokens` } },
-      plugins: { refLine: { value: AUTO_COMPACT, label: `Auto-compact ${compact(AUTO_COMPACT)}` } },
+      plugins: { refLine: { value: win, label: `Auto-compact ${compact(win)}` } },
     }),
   });
   legend('legend-ctx', 'c-context');
@@ -543,6 +543,7 @@ function renderSession() {
     ticks: { color: P.muted, maxRotation: 0, maxTicksLimit: 6, callback: (v) => fmtTs(v) },
   };
   const titleTs = (items) => fmtTs(items[0].parsed.x);
+  const win = s.compact_window;
 
   draw('c-s-ctx', {
     type: 'line',
@@ -553,7 +554,7 @@ function renderSession() {
       ],
     },
     options: {
-      ...options({ x: timeAxis, y: { suggestedMax: AUTO_COMPACT * 1.05 }, plugins: { refLine: { value: AUTO_COMPACT, label: `Auto-compact ${compact(AUTO_COMPACT)}` } },
+      ...options({ x: timeAxis, y: { suggestedMax: win * 1.05 }, plugins: { refLine: { value: win, label: `Auto-compact ${compact(win)}` } },
         tip: { callbacks: { title: titleTs, label: (c) => ` ${c.dataset.label}: ${int(c.parsed.y)} tokens` } } }),
       interaction: { mode: 'nearest', axis: 'x', intersect: false },
     },
