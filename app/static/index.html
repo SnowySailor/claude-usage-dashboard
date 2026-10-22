@@ -49,6 +49,19 @@
     tbody tr[data-sid]:hover { background: var(--surface-2); }
     .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
     dialog::backdrop { background: rgba(0,0,0,0.45); }
+    .nav-track { position: relative; overflow: hidden; border-radius: 8px; background: var(--surface-2); cursor: crosshair; touch-action: none; user-select: none; }
+    .nav-win {
+      --w: max(var(--span), 28px);
+      position: absolute; top: 0; bottom: 0; width: var(--w);
+      left: clamp(0px, calc(var(--mid) - var(--w) / 2), calc(100% - var(--w)));
+      border: 1px solid var(--accent); border-radius: 8px; cursor: grab;
+      box-shadow: 0 0 0 100vmax color-mix(in srgb, var(--page) 55%, transparent);
+    }
+    .nav-win.full { cursor: crosshair; }
+    .nav-win:focus-visible { outline: none; border-width: 2px; }
+    .nav-handle { position: absolute; top: 50%; left: 0; width: 8px; height: 20px; transform: translate(-50%, -50%); border: 1px solid var(--accent); border-radius: 3px; background: var(--surface); cursor: ew-resize; }
+    .nav-handle[data-edge="end"] { left: 100%; }
+    .nav-handle::before { content: ""; position: absolute; inset: -10px -3px; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -191,7 +204,7 @@
 
   <!-- Session drill-down -->
   <dialog id="session-dlg" class="card m-auto w-[min(1100px,calc(100vw-2rem))] max-h-[calc(100vh-2rem)] overflow-y-auto p-0 text-(--ink)">
-    <div class="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-(--grid) bg-(--surface) p-4">
+    <div id="s-head" class="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-(--grid) bg-(--surface) p-4">
       <div>
         <h2 id="s-title" class="font-semibold"></h2>
         <p id="s-sub" class="num text-sm text-(--ink-2)"></p>
@@ -200,6 +213,27 @@
     </div>
     <div class="grid gap-4 p-4">
       <div id="s-kpis" class="grid grid-cols-2 gap-3 sm:grid-cols-4"></div>
+      <section id="s-nav" class="sticky z-10 -mx-4 border-b border-(--grid) bg-(--surface) px-4 pt-2 pb-3">
+        <div class="flex flex-wrap items-center gap-2 text-sm">
+          <div id="s-presets" class="seg flex rounded-lg bg-(--surface-2) p-0.5" title="The latest part of the session. While this dialog is open, the window moves forward as new requests come in.">
+            <button data-span="30" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">30m</button>
+            <button data-span="60" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">1h</button>
+            <button data-span="120" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">2h</button>
+            <button data-span="240" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">4h</button>
+            <button data-span="480" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">8h</button>
+            <button data-span="1440" class="rounded-md px-3 py-1 text-(--ink-2) disabled:opacity-40">24h</button>
+            <button data-span="" class="rounded-md px-3 py-1 text-(--ink-2)">All</button>
+          </div>
+          <input id="s-from" type="datetime-local" class="ctl px-2 py-1" aria-label="Window start">
+          <span class="text-(--muted)">–</span>
+          <input id="s-to" type="datetime-local" class="ctl px-2 py-1" aria-label="Window end">
+          <span id="s-span" class="num text-(--ink-2)"></span>
+        </div>
+        <div id="s-track" class="nav-track mt-2 h-10">
+          <canvas id="c-s-nav"></canvas>
+          <div id="s-win" class="nav-win" tabindex="0" aria-label="Chart window. Drag it, or use the left and right arrow keys, to move it."><span class="nav-handle" data-edge="start"></span><span class="nav-handle" data-edge="end"></span></div>
+        </div>
+      </section>
       <section>
         <h3 class="font-medium">Context per request</h3>
         <p class="text-sm text-(--ink-2)">Main-thread drops are compactions or clears</p>

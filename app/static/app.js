@@ -10,6 +10,9 @@ const TOKEN_KEYS = COMPONENTS.slice(0, 5);
 // Reported cost with no matching transcript usage (tracked-only mode). Gray: it's the unknown remainder.
 const UNLOGGED = ['unlogged', 'Not in transcripts'];
 const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable'];
+const MIN_SPAN = 60_000;
+const DAY = 86_400_000;
+const TICK_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080].map((m) => m * 60_000);
 
 const $ = (s) => document.querySelector(s);
 const store = {
@@ -21,6 +24,8 @@ const state = {
   range: store.get('range', '7d'), from: store.get('from', null), to: store.get('to', null),
   project: '', model: '', tokensMode: store.get('tokensMode', 'nocr'), theme: store.get('theme', 'auto'),
   auto: store.get('auto', true), tracked: store.get('tracked', true), sort: { key: 'last', dir: -1 }, shown: 25, data: null, session: null,
+  // Session chart window. end: null follows the latest request; span: null starts at the first one.
+  sid: null, bounds: null, win: { end: null, span: null },
 };
 
 // ---------- formatting ----------
@@ -36,6 +41,7 @@ const usd = (v) => {
 const usdAxis = (v) => (v >= 1000 ? '$' + compactFmt.format(v) : '$' + nf({ maximumFractionDigits: v < 10 ? 2 : 0 }).format(v));
 const pct = (v, d = 0) => (v == null ? '—' : (v * 100).toFixed(d) + '%');
 const fmtDay = (s) => new Date(s + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const fmtDate = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 const fmtTs = (iso) => new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 const fmtDur = (ms) => {
   if (!ms) return '—';
@@ -46,6 +52,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const shortModel = (m) => (m || '—').replace(/^claude-/, '');
 const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
 const isoLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const dtLocal = (ms) => { const d = new Date(ms); return `${isoLocal(d)}T${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 
 // ---------- theme & palette ----------
 let P;
@@ -119,14 +126,24 @@ const valueLabelsPlugin = {
 Chart.register(refLinePlugin, valueLabelsPlugin);
 
 // 'index' mode with the index taken from the 'est' stack only: other series have their own x positions, so
-// their indexes don't line up.
+// their indexes don't line up. Points outside the visible window don't count.
 Chart.Interaction.modes.estIndex = (chart, e) => {
   const metas = chart.getSortedVisibleDatasetMetas().filter((m) => chart.data.datasets[m.index].stack === 'est');
   const pts = metas[0]?.data ?? [];
+  const { left, right } = chart.chartArea;
   let i = -1;
-  pts.forEach((p, j) => { if (i < 0 || Math.abs(p.x - e.x) < Math.abs(pts[i].x - e.x)) i = j; });
+  pts.forEach((p, j) => { if (p.x >= left && p.x <= right && (i < 0 || Math.abs(p.x - e.x) < Math.abs(pts[i].x - e.x))) i = j; });
   return i < 0 ? [] : metas.map((m) => ({ element: m.data[i], datasetIndex: m.index, index: i }));
 };
+
+// Ticks on round local times (every 5m, 1h, 1d, ...) instead of Chart.js's round millisecond counts.
+function timeTicks(axis) {
+  const { min, max } = axis;
+  const step = TICK_STEPS.find((s) => (max - min) / s <= 6) ?? TICK_STEPS.at(-1);
+  const shift = -new Date(min).getTimezoneOffset() * 60_000;
+  axis.ticks = [];
+  for (let t = Math.ceil((min + shift) / step) * step - shift; t <= max; t += step) axis.ticks.push({ value: t });
+}
 
 const charts = {};
 const hidden = {}; // chartId -> Set of hidden dataset labels, kept across refreshes
@@ -519,16 +536,123 @@ function renderSessions(d) {
 // ---------- session drill-down ----------
 async function openSession(sid) {
   const dlg = $('#session-dlg');
+  if (sid !== state.sid) {
+    state.win = { end: null, span: null };
+    $('#s-nav').hidden = true;
+  }
+  state.sid = sid;
   $('#s-title').textContent = 'Loading…';
   $('#s-sub').textContent = '';
   $('#s-kpis').innerHTML = '';
   if (!dlg.open) dlg.showModal();
+  await loadSession(sid);
+}
+
+async function loadSession(sid) {
   try {
-    state.session = await getJSON('/api/session/' + encodeURIComponent(sid) + '?tz=' + encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone));
+    const body = await getJSON('/api/session/' + encodeURIComponent(sid) + '?tz=' + encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone));
+    if (sid !== state.sid) return;
+    state.session = body;
     renderSession();
   } catch (e) {
     $('#s-title').textContent = 'Failed to load session: ' + e.message;
   }
+}
+
+function winRange() {
+  const { lo, hi } = state.bounds;
+  const end = state.win.end ?? hi;
+  return [state.win.span == null ? lo : Math.max(lo, end - state.win.span), end];
+}
+
+function setWin(a, b, keepSpan = false) {
+  const { lo, hi } = state.bounds;
+  if (keepSpan) {
+    const w = Math.min(b - a, hi - lo);
+    if (a < lo) [a, b] = [lo, lo + w];
+    if (b > hi) [a, b] = [hi - w, hi];
+  }
+  a = Math.max(a, lo);
+  b = Math.min(b, hi);
+  if (b - a < MIN_SPAN) { b = Math.min(hi, a + MIN_SPAN); a = Math.max(lo, b - MIN_SPAN); }
+  state.win = { end: b >= hi ? null : b, span: a <= lo && b >= hi ? null : b - a };
+  applyWin();
+}
+
+let winFrame = 0;
+function applyWin() {
+  syncWin();
+  cancelAnimationFrame(winFrame);
+  winFrame = requestAnimationFrame(() => {
+    const [a, b] = winRange();
+    for (const id of ['c-s-ctx', 'c-s-cost']) {
+      Object.assign(charts[id].options.scales.x, { min: a, max: b });
+      charts[id].update('none');
+    }
+  });
+}
+
+function syncWin() {
+  const { lo, hi } = state.bounds;
+  const [a, b] = winRange();
+  const win = $('#s-win');
+  win.style.setProperty('--mid', (((a + b) / 2 - lo) / (hi - lo)) * 100 + '%');
+  win.style.setProperty('--span', ((b - a) / (hi - lo)) * 100 + '%');
+  win.classList.toggle('full', a <= lo && b >= hi);
+  for (const [el, v] of [[$('#s-from'), dtLocal(a)], [$('#s-to'), dtLocal(b)]]) if (el.value !== v) el.value = v;
+  $('#s-span').textContent = fmtDur(b - a);
+  document.querySelectorAll('#s-presets button').forEach((btn) => {
+    const span = btn.dataset.span ? btn.dataset.span * 60_000 : null;
+    btn.disabled = span != null && span >= hi - lo;
+    btn.setAttribute('aria-pressed', String(state.win.end == null && state.win.span === span));
+  });
+}
+
+// Drag a handle to move one edge, drag the window to slide it, drag on the track to draw a new window,
+// or click the track to center the window there.
+function dragWin(e) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const el = e.target;
+  const { lo, hi } = state.bounds;
+  const rect = $('#s-track').getBoundingClientRect();
+  const k = (hi - lo) / rect.width;
+  const at = (x) => lo + (x - rect.left) * k;
+  const [a, b] = winRange();
+  const x0 = e.clientX;
+  const full = a <= lo && b >= hi;
+  const mode = el.dataset.edge || (el.closest('#s-win') && !full ? 'move' : 'new');
+  let moved = false;
+  const ac = new AbortController();
+  el.setPointerCapture(e.pointerId);
+  el.addEventListener('pointermove', (ev) => {
+    const d = (ev.clientX - x0) * k;
+    moved ||= Math.abs(ev.clientX - x0) > 3;
+    if (mode === 'move') setWin(a + d, b + d, true);
+    else if (mode === 'start') setWin(Math.min(a + d, b - MIN_SPAN), b);
+    else if (mode === 'end') setWin(a, Math.max(b + d, a + MIN_SPAN));
+    else if (moved) setWin(Math.min(at(x0), at(ev.clientX)), Math.max(at(x0), at(ev.clientX)));
+  }, { signal: ac.signal });
+  el.addEventListener('pointerup', () => {
+    if (mode === 'new' && !moved && !full) setWin(at(x0) - (b - a) / 2, at(x0) + (b - a) / 2, true);
+    ac.abort();
+  }, { signal: ac.signal });
+  for (const type of ['pointercancel', 'lostpointercapture']) el.addEventListener(type, () => ac.abort(), { signal: ac.signal });
+}
+
+function renderNav(main) {
+  const { lo, hi } = state.bounds;
+  $('#s-nav').hidden = hi - lo < 2 * MIN_SPAN;
+  draw('c-s-nav', {
+    type: 'line',
+    data: { datasets: [lineDS('Main thread', main.map((r) => ({ x: Date.parse(r.ts), y: r.ctx })), P.s[0], { borderWidth: 1, fill: 'origin', backgroundColor: P.s[0] + '33' })] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, events: [],
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: { x: { type: 'linear', display: false, min: lo, max: hi }, y: { display: false, beginAtZero: true, grace: '10%' } },
+    },
+  });
+  syncWin();
 }
 
 function renderSession() {
@@ -548,9 +672,12 @@ function renderSession() {
   ].join('');
 
   const xs = reqs.map((r) => Date.parse(r.ts)).concat(events.map((e) => Date.parse(e.ts)));
+  state.bounds = { lo: Math.min(...xs), hi: Math.max(...xs) };
+  const { hi } = state.bounds;
+  const [winStart, winEnd] = winRange();
   const timeAxis = {
-    type: 'linear', min: Math.min(...xs), max: Math.max(...xs), grid: { display: false }, border: { color: P.axis },
-    ticks: { color: P.muted, maxRotation: 0, maxTicksLimit: 6, callback: (v) => fmtTs(v) },
+    type: 'linear', min: winStart, max: winEnd, grid: { display: false }, border: { color: P.axis }, afterBuildTicks: timeTicks,
+    ticks: { color: P.muted, maxRotation: 0, autoSkipPadding: 12, callback(v) { return this.max - this.min > 3 * DAY ? fmtDate(v) : fmtTs(v); } },
   };
   const titleTs = (items) => fmtTs(items[0].parsed.x);
   const win = s.compact_window;
@@ -578,22 +705,29 @@ function renderSession() {
     for (const [k] of COMPONENTS) { running[k] += r.cost[k]; series[k].push({ x, y: running[k] }); }
   }
   // Cost reported after the last request is from calls the transcript doesn't log (recaps, prompt suggestions).
-  if (reqs.length && Date.parse(reqs.at(-1).ts) < timeAxis.max) {
-    for (const [k] of COMPONENTS) series[k].push({ x: timeAxis.max, y: running[k] });
+  if (reqs.length && Date.parse(reqs.at(-1).ts) < hi) {
+    for (const [k] of COMPONENTS) series[k].push({ x: hi, y: running[k] });
   }
   const comps = COMPONENTS.map((c, i) => [...c, i]).filter(([k]) => running[k] > 0 || k !== 'web_search');
   const datasets = comps.map(([k, label, i], n) => lineDS(label, series[k], P.s[i], {
     fill: n === 0 ? 'origin' : '-1', backgroundColor: P.s[i], borderColor: P.s[i], borderWidth: 0, stack: 'est', pointHoverRadius: 0, stepped: 'before',
   }));
+  const reported = events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd }));
   if (events.length) {
-    datasets.push(lineDS('Reported', events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd })), P.ink, { stack: 'billed', stepped: 'before', order: -1 }));
+    datasets.push(lineDS('Reported', reported, P.ink, { stack: 'billed', stepped: 'before', order: -1 }));
   }
-  const billedAt = (x) => { let v = null; for (const e of events) { if (Date.parse(e.ts) <= x) v = e.cost_usd; else break; } return v; };
+  const lastAt = (pts, x) => { let v = null; for (const p of pts) { if (p.x <= x) v = p.y; else break; } return v; };
+  const billedAt = (x) => lastAt(reported, x);
+  // The totals only grow, so the window's highest value is at its end, even when no point falls inside it.
+  const fitWindowEnd = (sc) => {
+    const x = sc.chart.options.scales.x.max;
+    sc.max = Math.max(sc.max, comps.reduce((a, [k]) => a + (lastAt(series[k], x) ?? 0), 0), billedAt(x) ?? 0);
+  };
   draw('c-s-cost', {
     type: 'line',
     data: { datasets },
     options: {
-      ...options({ stacked: true, yFmt: usdAxis, x: { ...timeAxis, stacked: false },
+      ...options({ stacked: true, yFmt: usdAxis, x: { ...timeAxis, stacked: false }, y: { afterDataLimits: fitWindowEnd },
         tip: {
           filter: (item) => item.dataset.stack === 'est',
           itemSort: (a, b) => b.datasetIndex - a.datasetIndex,
@@ -606,6 +740,7 @@ function renderSession() {
     },
   });
   legend('legend-s-cost', 'c-s-cost');
+  renderNav(main);
 }
 
 // ---------- wiring ----------
@@ -656,9 +791,33 @@ $('#sessions').addEventListener('click', (e) => { const tr = e.target.closest('t
 $('#more').addEventListener('click', () => { state.shown += 50; renderSessions(state.data); });
 $('#s-close').addEventListener('click', () => $('#session-dlg').close());
 $('#session-dlg').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+new ResizeObserver(() => { $('#s-nav').style.top = $('#s-head').offsetHeight + 'px'; }).observe($('#s-head'));
+document.querySelectorAll('#s-presets button').forEach((b) => b.addEventListener('click', () => {
+  state.win = { end: null, span: b.dataset.span ? b.dataset.span * 60_000 : null };
+  applyWin();
+}));
+['s-from', 's-to'].forEach((id) => $('#' + id).addEventListener('change', () => {
+  const { lo, hi } = state.bounds;
+  // The inputs only show minutes; keep a window that reaches the first or last request pinned there.
+  const read = (v) => (v === dtLocal(lo) ? lo : v === dtLocal(hi) ? hi : Date.parse(v));
+  const [a, b] = [read($('#s-from').value), read($('#s-to').value)];
+  if (Number.isNaN(a) || Number.isNaN(b)) return;
+  setWin(Math.min(a, b), Math.max(a, b));
+}));
+$('#s-track').addEventListener('pointerdown', dragWin);
+$('#s-win').addEventListener('keydown', (e) => {
+  const dir = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+  if (!dir) return;
+  e.preventDefault();
+  const [a, b] = winRange();
+  const d = dir * (b - a) * (e.shiftKey ? 1 : 0.1);
+  setWin(a + d, b + d, true);
+});
 
 setInterval(() => {
-  if (state.auto && document.visibilityState === 'visible' && !$('#session-dlg').open) refresh();
+  if (!state.auto || document.visibilityState !== 'visible') return;
+  if ($('#session-dlg').open) loadSession(state.sid);
+  else refresh();
 }, REFRESH_MS);
 
 applyTheme();
