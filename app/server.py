@@ -11,7 +11,7 @@ each request's token counts x pricing.json.
 import json
 import os
 import sqlite3
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -139,11 +139,16 @@ def add(dst, src):
 def dashboard(q):
     tz = get_tz(q)
     project, model = q.get("project") or None, q.get("model") or None
+    tracked_only = q.get("tracked") == "1"
     d_from, d_to = parse_date(q.get("from")), parse_date(q.get("to"))
     lo = utc_iso(datetime(d_from.year, d_from.month, d_from.day, tzinfo=tz)) if d_from else ""
     hi = utc_iso(datetime(d_to.year, d_to.month, d_to.day, tzinfo=tz) + timedelta(days=1)) if d_to else "9999"
 
     def load(db):
+        nonlocal lo
+        tracked_since = db.execute("SELECT MIN(ts) FROM cost_events").fetchone()[0]
+        if tracked_only and tracked_since:
+            lo = max(lo, tracked_since)
         return (
             {r["session_id"]: dict(r) for r in db.execute(
                 "SELECT session_id, cwd, model, cost_usd, lines_added, lines_removed FROM session_stats")},
@@ -151,7 +156,7 @@ def dashboard(q):
                        "ORDER BY ts", (lo, hi)).fetchall(),
             db.execute("SELECT session_id, ts, delta_usd FROM cost_events WHERE ts >= ? AND ts < ?", (lo, hi)).fetchall(),
             db.execute("SELECT MIN(ts), MAX(ts) FROM requests WHERE model != '<synthetic>'").fetchone(),
-            db.execute("SELECT MIN(ts) FROM cost_events").fetchone()[0],
+            tracked_since,
             [r[0] for r in db.execute("SELECT DISTINCT model FROM requests WHERE model IS NOT NULL "
                                       "AND model != '<synthetic>' ORDER BY 1")],
             # Requests before the range that an in-range cost event still pays for: a session's first
@@ -163,9 +168,12 @@ def dashboard(q):
                            ) w USING (session_id)
                            WHERE ts < ? AND ts > COALESCE(w.prev, '') AND model != '<synthetic>'""",
                        (lo, lo, hi, lo)).fetchall() if lo else [],
+            dict(db.execute("SELECT session_id, MIN(ts) FROM cost_events GROUP BY session_id").fetchall()),
+            dict(db.execute("SELECT session_id, MIN(ts) FROM requests GROUP BY session_id").fetchall()),
         )
 
-    sessions, reqs, events, (data_min, data_max), tracked_since, models, pre_range = read(load)
+    (sessions, reqs, events, (data_min, data_max), tracked_since, models, pre_range,
+     first_event, first_request) = read(load)
     proj = {sid: project_name(s["cwd"]) for sid, s in sessions.items()}
     local_day = lambda ts: parse_ts(ts).astimezone(tz).date()
 
@@ -173,12 +181,21 @@ def dashboard(q):
         return {"tokens": zeros(TOKENS), "cost": zeros(COMPONENTS), "requests": 0, "thinking": 0,
                 "savings": 0.0, "ctx_max": 0, "ctx_sum": 0, "ctx_n": 0, "actual": 0.0}
 
-    keep = lambda r: not (project and proj.get(r["session_id"]) != project or model and r["model"] != model)
-    last_event = {}
-    for e in events:
-        last_event[e["session_id"]] = max(e["ts"], last_event.get(e["session_id"], ""))
-    # Estimated cost of exactly the requests the in-range cost events pay for, to compare with the billed total.
-    est_billed = sum(sum((request_cost(r) or {}).values()) for r in pre_range if keep(r))
+    # Tracked-only mode keeps just what the reported cost fully covers: sessions that have cost events, minus,
+    # for sessions already running when tracking began, their first event (it carries all earlier spend) and
+    # every request that event paid for.
+    def cutoff(sid):
+        return first_event[sid] if first_request.get(sid, "") < tracked_since else ""
+
+    def in_scope(sid, ts):
+        if project and proj.get(sid) != project:
+            return False
+        return not tracked_only or sid in first_event and ts > cutoff(sid)
+
+    keep = lambda r: in_scope(r["session_id"], r["ts"]) and not (model and r["model"] != model)
+    # Actual (reported) cost is recorded per session, so it can't be split by model.
+    show_actual = model is None
+    kept_events = [e for e in events if in_scope(e["session_id"], e["ts"])] if show_actual else []
 
     total = new_bucket()
     days = defaultdict(new_bucket)
@@ -208,8 +225,6 @@ def dashboard(q):
         s["subagent_requests"] += r["agent_id"] is not None
         if r["agent_id"] is not None:
             subagent_cost += est
-        if r["ts"] <= last_event.get(sid, ""):
-            est_billed += est
         for b in (total, days[local.date().isoformat()], by_model[r["model"]], by_project[proj.get(sid, "(unknown)")],
                   hourly[local.hour], s):
             add(b["tokens"], toks)
@@ -222,14 +237,26 @@ def dashboard(q):
                 b["ctx_sum"] += ctx
                 b["ctx_n"] += 1
 
-    # Actual billed cost is recorded per session, so it can't be split by model.
-    show_actual = model is None
+    # Attribute each request's estimated cost to the cost event that paid for it. What an event reports beyond
+    # its requests' estimate is "unlogged": calls whose usage never reaches the transcript (e.g. compaction).
+    covered = defaultdict(deque)
+    for r in sorted((r for r in list(pre_range) + list(reqs) if keep(r)), key=lambda r: r["ts"]):
+        covered[r["session_id"]].append(r)
+    attributed = defaultdict(lambda: zeros(COMPONENTS + ("unlogged",)))
+    est_billed = 0.0
+    for e in sorted(kept_events, key=lambda e: e["ts"]):
+        queue, cost = covered[e["session_id"]], zeros(COMPONENTS)
+        while queue and queue[0]["ts"] <= e["ts"]:
+            add(cost, request_cost(queue.popleft()) or {})
+        bucket = attributed[local_day(e["ts"]).isoformat()]
+        add(bucket, cost)
+        bucket["unlogged"] += e["delta_usd"] - sum(cost.values())
+        est_billed += sum(cost.values())
+
     if show_actual:
-        for e in events:
+        for e in kept_events:
             sid = e["session_id"]
             p = proj.get(sid, "(unknown)")
-            if project and p != project:
-                continue
             for b in (total, days[local_day(e["ts"]).isoformat()], by_project[p]):
                 b["actual"] += e["delta_usd"]
                 b["billed"] = True
@@ -245,6 +272,10 @@ def dashboard(q):
 
     # Continuous day axis: the selected range, or (for "all") the span of the data.
     first_day = d_from or (local_day(data_min) if data_min else datetime.now(tz).date())
+    if tracked_only and tracked_day:
+        first_day = max(first_day, tracked_day)
+    # In tracked-only mode the cost split is by billing event, so each day's parts sum to its reported cost.
+    split = tracked_only and show_actual and tracked_since is not None
     last_day = d_to or max(datetime.now(tz).date(), first_day)
     daily = []
     d = first_day
@@ -252,7 +283,9 @@ def dashboard(q):
         b = days.get(d.isoformat()) or new_bucket()
         tracked = show_actual and tracked_day is not None and d >= tracked_day
         daily.append({
-            "day": d.isoformat(), "tokens": b["tokens"], "cost": b["cost"], "est": est_of(b),
+            "day": d.isoformat(), "tokens": b["tokens"],
+            "cost": attributed.get(d.isoformat()) or zeros(COMPONENTS + ("unlogged",)) if split else b["cost"],
+            "est": est_of(b),
             "actual": b["actual"] if tracked else None, "requests": b["requests"],
             "ctx_max": b["ctx_max"], "ctx_avg": b["ctx_sum"] / b["ctx_n"] if b["ctx_n"] else None,
             "cache_hit": hit_rate(b["tokens"]) if b["requests"] else None,
@@ -280,14 +313,16 @@ def dashboard(q):
             "projects": sorted({p for p in proj.values()}),
             "models": models,
             "data_min": data_min, "data_max": data_max, "tracked_since": tracked_since,
-            "show_actual": show_actual,
+            "show_actual": show_actual, "tracked_only": tracked_only, "split": split,
         },
         "kpis": {
             "est": est_total, "actual": total["actual"] if show_actual else None,
             "est_billed": est_billed,
             "unattributed": total["actual"] - est_billed if show_actual else None,
             "requests": total["requests"], "sessions": len(per_session),
-            "tokens": total["tokens"], "thinking": total["thinking"], "cost": total["cost"],
+            "tokens": total["tokens"], "thinking": total["thinking"],
+            "cost": {k: sum(a[k] for a in attributed.values()) for k in COMPONENTS + ("unlogged",)} if split
+                    else total["cost"],
             "cache_hit": hit_rate(total["tokens"]), "cache_savings": total["savings"],
             "ctx_max": total["ctx_max"], "ctx_avg": total["ctx_sum"] / total["ctx_n"] if total["ctx_n"] else None,
             "subagent_cost": subagent_cost, "unpriced_requests": unpriced,

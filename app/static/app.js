@@ -8,6 +8,8 @@ const COMPONENTS = [
   ['cache_read', 'Cache read'], ['output', 'Output'], ['web_search', 'Web search'],
 ];
 const TOKEN_KEYS = COMPONENTS.slice(0, 5);
+// Reported cost with no matching transcript usage (tracked-only mode). Gray: it's the unknown remainder.
+const UNLOGGED = ['unlogged', 'Not in transcripts'];
 const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable'];
 
 const $ = (s) => document.querySelector(s);
@@ -19,7 +21,7 @@ const store = {
 const state = {
   range: store.get('range', '7d'), from: store.get('from', null), to: store.get('to', null),
   project: '', model: '', tokensMode: store.get('tokensMode', 'nocr'), theme: store.get('theme', 'auto'),
-  auto: store.get('auto', true), sort: { key: 'last', dir: -1 }, shown: 25, data: null, session: null,
+  auto: store.get('auto', true), tracked: store.get('tracked', true), sort: { key: 'last', dir: -1 }, shown: 25, data: null, session: null,
 };
 
 // ---------- formatting ----------
@@ -228,6 +230,7 @@ async function refresh() {
   if (to) q.set('to', to);
   if (state.project) q.set('project', state.project);
   if (state.model) q.set('model', state.model);
+  if (state.tracked) q.set('tracked', '1');
   try {
     state.data = await getJSON('/api/dashboard?' + q);
     $('#error').textContent = '';
@@ -254,9 +257,8 @@ function render() {
   renderSessions(d);
   const m = d.meta;
   $('#updated').textContent = `updated ${new Date().toLocaleTimeString()}` + (m.data_max ? ` · last request ${fmtTs(m.data_max)}` : '');
-  $('#tracked-note').textContent = !m.show_actual
-    ? 'hidden while a model filter is on, since billing is recorded per session'
-    : m.tracked_since ? `recorded since ${fmtTs(m.tracked_since)}` : 'no billing data yet';
+  $('#tracked-note').textContent = !m.tracked_since ? 'No reported cost has been recorded yet.'
+    : `Cost tracking started ${fmtTs(m.tracked_since)}.` + (m.tracked_only ? ' Earlier data is hidden.' : '');
 }
 
 function syncControls(d) {
@@ -267,6 +269,8 @@ function syncControls(d) {
   fillSelect($('#project'), d.meta.projects, state.project, 'All projects', (x) => x);
   fillSelect($('#model'), d.meta.models, state.model, 'All models', shortModel);
   $('#auto').checked = state.auto;
+  $('#tracked').checked = state.tracked;
+  $('#from').min = state.tracked && d.meta.tracked_since ? isoLocal(new Date(d.meta.tracked_since)) : '';
 }
 
 function fillSelect(el, values, current, allLabel, label) {
@@ -282,31 +286,49 @@ function tile(label, value, sub = '') {
 
 function renderKpis(d) {
   const k = d.kpis;
-  let billedSub;
-  if (!d.meta.show_actual) billedSub = 'n/a with a model filter';
-  else if (!d.meta.tracked_since) billedSub = 'no billing data yet';
-  else if (k.unattributed != null && k.actual > 0) billedSub = `${usd(k.unattributed)} more than token estimate`;
-  else billedSub = `recorded since ${fmtDay(isoLocal(new Date(d.meta.tracked_since)))}`;
   const subShare = k.est ? k.subagent_cost / k.est : 0;
-  $('#kpis').innerHTML = [
-    tile('Billed', usd(k.actual), billedSub),
-    tile('Estimated from tokens', usd(k.est), k.unpriced_requests ? `${int(k.unpriced_requests)} requests unpriced` : `${pct(subShare)} from subagents`),
+  const estSub = k.unpriced_requests ? `${int(k.unpriced_requests)} requests unpriced` : `${pct(subShare)} from subagents`;
+  let cost;
+  if (d.meta.split) {
+    // Tracked-only: one number. The token-type split below sums to it, with the remainder shown as its own part.
+    cost = [tile('Cost', usd(k.actual), k.cost.unlogged > 0.005
+      ? `${usd(k.cost.unlogged)} not in transcripts (compaction)` : 'reported by Claude Code')];
+  } else if (!d.meta.show_actual) {
+    cost = [tile('Estimated cost', usd(k.est), 'model filter on: estimated from tokens only')];
+  } else {
+    let sub = 'no reported cost recorded yet';
+    if (d.meta.tracked_since && k.actual > 0) sub = `${usd(k.unattributed)} more than the token estimate`;
+    else if (d.meta.tracked_since) sub = `tracking started ${fmtDay(isoLocal(new Date(d.meta.tracked_since)))}`;
+    cost = [tile('Reported by Claude Code', usd(k.actual), sub), tile('Estimated from tokens', usd(k.est), estSub)];
+  }
+  const tiles = [
+    ...cost,
     tile('Cache hit rate', pct(k.cache_hit, 1), `${compact(k.tokens.cache_read)} cache-read tokens`),
     tile('Cache savings', usd(k.cache_savings), 'vs no caching, net of write premium'),
     tile('Requests', int(k.requests), `${int(k.sessions)} sessions`),
     tile('Output tokens', compact(k.tokens.output), `${compact(k.thinking)} thinking · peak ctx ${compact(k.ctx_max)}`),
-  ].join('');
+  ];
+  const el = $('#kpis');
+  el.classList.toggle('lg:grid-cols-6', tiles.length === 6);
+  el.classList.toggle('lg:grid-cols-5', tiles.length === 5);
+  el.innerHTML = tiles.join('');
 }
 
+// [key, label, color] for each cost part with data; the unlogged remainder only in tracked-only mode.
 function presentComponents(d) {
-  return COMPONENTS.map((c, i) => [...c, i]).filter(([key]) => d.kpis.cost[key] > 0 || key !== 'web_search');
+  const parts = COMPONENTS.map(([key, label], i) => [key, label, P.s[i]]).filter(([key]) => d.kpis.cost[key] > 0 || key !== 'web_search');
+  if (d.meta.split) parts.push([...UNLOGGED, P.muted]);
+  return parts;
 }
 
 function renderDailyCost(d) {
   const labels = d.daily.map((x) => fmtDay(x.day));
-  const datasets = presentComponents(d).map(([key, label, i]) => barDS(label, d.daily.map((x) => x.cost[key]), P.s[i]));
-  if (d.meta.show_actual && d.daily.some((x) => x.actual != null)) {
-    datasets.push(lineDS('Billed', d.daily.map((x) => x.actual), P.ink, { stack: 'billed', pointRadius: 3, pointBackgroundColor: P.ink, pointBorderColor: P.surface, pointBorderWidth: 2, order: -1 }));
+  const datasets = presentComponents(d).map(([key, label, color]) => barDS(label, d.daily.map((x) => x.cost[key]), color));
+  $('#daily-cost-sub').textContent = d.meta.split
+    ? 'Cost reported by Claude Code, split by token type. Gray is reported cost whose tokens never reach the transcript (compaction summaries).'
+    : 'Bars are estimated from tokens × pricing.json. The line is the cost Claude Code reported.';
+  if (!d.meta.split && d.meta.show_actual && d.daily.some((x) => x.actual != null)) {
+    datasets.push(lineDS('Reported', d.daily.map((x) => x.actual), P.ink, { stack: 'billed', pointRadius: 3, pointBackgroundColor: P.ink, pointBorderColor: P.surface, pointBorderWidth: 2, order: -1 }));
   }
   draw('c-daily-cost', {
     type: 'bar',
@@ -317,7 +339,7 @@ function renderDailyCost(d) {
         itemSort: (a, b) => b.datasetIndex - a.datasetIndex,
         callbacks: {
           label: (c) => ` ${c.dataset.label}: ${usd(c.parsed.y)}`,
-          footer: (items) => `Estimated: ${usd(d.daily[items[0].dataIndex].est)}`,
+          footer: (items) => (d.meta.split ? `Total: ${usd(d.daily[items[0].dataIndex].actual)}` : `Estimated: ${usd(d.daily[items[0].dataIndex].est)}`),
         },
       },
     }),
@@ -328,7 +350,7 @@ function renderDailyCost(d) {
   $('#t-daily').innerHTML =
     `<thead class="sticky top-0 bg-(--surface) text-(--muted)"><tr class="border-b border-(--grid)"><th class="py-1 pr-3 text-left font-medium">Day</th><th class="pr-3 font-medium">Requests</th>` +
     comps.map(([, label]) => `<th class="pr-3 font-medium">${label}</th>`).join('') +
-    `<th class="pr-3 font-medium">Estimated</th><th class="font-medium">Billed</th></tr></thead><tbody>` +
+    `<th class="pr-3 font-medium">Estimated</th><th class="font-medium">Reported</th></tr></thead><tbody>` +
     d.daily.slice().reverse().map((x) => `<tr class="border-b border-(--grid)"><td class="py-1 pr-3 text-left">${fmtDay(x.day)}</td><td class="pr-3">${int(x.requests)}</td>` +
       comps.map(([key]) => `<td class="pr-3">${usd(x.cost[key])}</td>`).join('') +
       `<td class="pr-3 font-medium">${usd(x.est)}</td><td>${usd(x.actual)}</td></tr>`).join('') + '</tbody>';
@@ -336,16 +358,17 @@ function renderDailyCost(d) {
 
 function renderComponents(d) {
   const comps = presentComponents(d);
-  const total = d.kpis.est || 1;
+  const total = comps.reduce((a, [key]) => a + d.kpis.cost[key], 0) || 1;
+  $('#components-sub').textContent = d.meta.split ? 'Reported cost for the selected range' : 'Estimated cost for the selected range';
   draw('c-components', {
     type: 'bar',
     data: {
       labels: comps.map(([, label]) => label),
-      datasets: [{ label: 'Estimated cost', data: comps.map(([key]) => d.kpis.cost[key]), backgroundColor: comps.map(([, , i]) => P.s[i]), borderRadius: 4, borderSkipped: 'start', maxBarThickness: 24 }],
+      datasets: [{ label: 'Estimated cost', data: comps.map(([key]) => d.kpis.cost[key]), backgroundColor: comps.map(([, , color]) => color), borderRadius: 4, borderSkipped: 'start', maxBarThickness: 24 }],
     },
     options: options({
       horizontal: true, yFmt: usdAxis,
-      tip: { callbacks: { label: (c) => ` ${usd(c.parsed.x)} (${pct(c.parsed.x / total, 1)})`, afterLabel: (c) => `${compact(d.kpis.tokens[comps[c.dataIndex][0]])} tokens` } },
+      tip: { callbacks: { label: (c) => ` ${usd(c.parsed.x)} (${pct(c.parsed.x / total, 1)})`, afterLabel: (c) => (comps[c.dataIndex][0] in d.kpis.tokens ? `${compact(d.kpis.tokens[comps[c.dataIndex][0]])} tokens` : 'mostly compaction summaries') } },
       plugins: { valueLabels: { format: (v) => `${usd(v)} · ${pct(v / total)}` } }, padRight: 96,
     }),
   });
@@ -378,7 +401,7 @@ function renderProjects(d) {
     },
     options: options({
       horizontal: true, yFmt: usdAxis,
-      tip: { callbacks: { label: (c) => ` Estimated ${usd(c.parsed.x)}`, afterLabel: (c) => (rows[c.dataIndex].actual != null ? `Billed ${usd(rows[c.dataIndex].actual)}` : '') + ` · ${int(rows[c.dataIndex].requests)} requests` } },
+      tip: { callbacks: { label: (c) => ` Estimated ${usd(c.parsed.x)}`, afterLabel: (c) => (rows[c.dataIndex].actual != null ? `Reported ${usd(rows[c.dataIndex].actual)}` : '') + ` · ${int(rows[c.dataIndex].requests)} requests` } },
       plugins: { valueLabels: { format: (v) => usd(v) } }, padRight: 72,
       x: { ticks: { color: P.muted, autoSkip: false, callback(v) { const l = this.getLabelForValue(v); return l.length > 16 ? l.slice(0, 15) + '…' : l; } } },
     }),
@@ -508,7 +531,7 @@ function renderSession() {
     s.duration_ms && `wall ${fmtDur(s.duration_ms)}, API ${fmtDur(s.api_duration_ms)}`,
     s.lines_added != null && `+${int(s.lines_added)} / −${int(s.lines_removed)} lines`].filter(Boolean).join(' · ');
   $('#s-kpis').innerHTML = [
-    tile('Billed', usd(s.cost_usd), s.cost_usd != null ? `${usd(s.cost_usd - est)} vs estimate` : 'not tracked'),
+    tile('Reported', usd(s.cost_usd), s.cost_usd != null ? `${usd(s.cost_usd - est)} more than estimate` : 'not tracked'),
     tile('Estimated', usd(est), `${pct(est ? subs.reduce((a, r) => a + sum(r.cost), 0) / est : 0)} from subagents`),
     tile('Requests', int(reqs.length), `${int(subs.length)} subagent`),
     tile('Peak context', compact(Math.max(0, ...main.map((r) => r.ctx))), `${compact(s.output_tokens)} output tokens`),
@@ -548,7 +571,7 @@ function renderSession() {
     fill: n === 0 ? 'origin' : '-1', backgroundColor: P.s[i], borderColor: P.s[i], borderWidth: 0, stack: 'est', pointHoverRadius: 0,
   }));
   if (events.length) {
-    datasets.push(lineDS('Billed', events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd })), P.ink, { stack: 'billed', stepped: 'before' }));
+    datasets.push(lineDS('Reported', events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd })), P.ink, { stack: 'billed', stepped: 'before' }));
   }
   const billedAt = (x) => { let v = null; for (const e of events) { if (Date.parse(e.ts) <= x) v = e.cost_usd; else break; } return v; };
   draw('c-s-cost', {
@@ -561,7 +584,7 @@ function renderSession() {
           itemSort: (a, b) => b.datasetIndex - a.datasetIndex,
           callbacks: {
             title: titleTs, label: (c) => ` ${c.dataset.label}: ${usd(series[comps[c.datasetIndex][0]][c.dataIndex].y)}`,
-            footer: (items) => { const x = items[0].parsed.x; const b = billedAt(x); const e = comps.reduce((a, [k]) => a + series[k][items[0].dataIndex].y, 0); return `Estimated ${usd(e)}` + (b != null ? ` · billed ${usd(b)}` : ''); },
+            footer: (items) => { const x = items[0].parsed.x; const b = billedAt(x); const e = comps.reduce((a, [k]) => a + series[k][items[0].dataIndex].y, 0); return `Estimated ${usd(e)}` + (b != null ? ` · reported ${usd(b)}` : ''); },
           },
         } }),
     },
@@ -593,6 +616,7 @@ document.querySelectorAll('#tokens-mode button').forEach((b) => b.addEventListen
   store.set('tokensMode', state.tokensMode);
   render();
 }));
+$('#tracked').addEventListener('change', (e) => { state.tracked = e.target.checked; store.set('tracked', state.tracked); state.shown = 25; refresh(); });
 $('#auto').addEventListener('change', (e) => { state.auto = e.target.checked; store.set('auto', state.auto); });
 $('#refresh').addEventListener('click', refresh);
 $('#theme').addEventListener('click', () => {

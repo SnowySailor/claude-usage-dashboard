@@ -82,6 +82,9 @@
       <input id="to" type="date" class="ctl px-2 py-1" aria-label="To">
       <select id="project" class="ctl px-2 py-1.5" aria-label="Project"><option value="">All projects</option></select>
       <select id="model" class="ctl px-2 py-1.5" aria-label="Model"><option value="">All models</option></select>
+      <label class="flex items-center gap-2 text-(--ink-2)" title="Hide everything from before cost tracking started, so the cost and its token-type split agree">
+        <input id="tracked" type="checkbox" class="accent-(--accent)" checked> Tracked data only
+      </label>
       <span id="error" class="text-(--critical)"></span>
     </div>
 
@@ -93,7 +96,7 @@
       <div class="flex flex-wrap items-baseline justify-between gap-2">
         <div>
           <h2 class="font-semibold">Daily cost by token type</h2>
-          <p class="text-sm text-(--ink-2)">Bars: estimated from tokens × <code>pricing.json</code>. Line: billed, as Claude Code reports it (<span id="tracked-note"></span>).</p>
+          <p class="text-sm text-(--ink-2)"><span id="daily-cost-sub"></span> <span id="tracked-note"></span></p>
         </div>
       </div>
       <div id="legend-cost" class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm text-(--ink-2)"></div>
@@ -107,7 +110,7 @@
     <div class="mt-4 grid gap-4 lg:grid-cols-3">
       <section class="card p-4">
         <h2 class="font-semibold">Cost by token type</h2>
-        <p class="text-sm text-(--ink-2)">Estimated cost for the selected range</p>
+        <p id="components-sub" class="text-sm text-(--ink-2)"></p>
         <div class="chart-box mt-3 h-64"><canvas id="c-components"></canvas></div>
       </section>
       <section class="card p-4">
@@ -169,7 +172,7 @@
               <th data-sort="project" class="py-2 pr-3 font-medium">Project</th>
               <th data-sort="model" class="py-2 pr-3 font-medium">Model</th>
               <th data-sort="requests" class="py-2 pr-3 text-right font-medium">Requests</th>
-              <th data-sort="actual" class="py-2 pr-3 text-right font-medium">Billed</th>
+              <th data-sort="actual" class="py-2 pr-3 text-right font-medium">Reported</th>
               <th data-sort="est" class="py-2 pr-3 text-right font-medium">Estimated</th>
               <th data-sort="ctx_max" class="py-2 pr-3 text-right font-medium">Peak context</th>
               <th data-sort="output" class="py-2 pr-3 text-right font-medium">Output</th>
@@ -183,7 +186,7 @@
       <button id="more" class="ctl mt-3 hidden px-3 py-1.5 text-sm hover:bg-(--surface-2)">Show more</button>
     </section>
 
-    <p class="mt-6 text-xs text-(--muted)">Estimates assume API list prices from <code>app/pricing.json</code>. Billed numbers come from Claude Code's <code>cost.total_cost_usd</code> via the statusline. Requests missing from transcripts, like compaction or title generation, appear as an unestimated gap.</p>
+    <p class="mt-6 text-xs text-(--muted)">All dollar amounts are what this usage would cost at API list prices. On a Pro or Max plan they aren't what you pay. Reported cost is Claude Code's <code>cost.total_cost_usd</code>, captured via the statusline. Estimates are tokens × <code>app/pricing.json</code>. Calls whose usage never reaches the transcript, such as compaction summaries, are only in the reported cost.</p>
   </div>
 
   <!-- Session drill-down -->
@@ -205,7 +208,7 @@
       </section>
       <section>
         <h3 class="font-medium">Cumulative cost</h3>
-        <p class="text-sm text-(--ink-2)">Stacked: estimated by token type. Line: billed.</p>
+        <p class="text-sm text-(--ink-2)">Stacked areas are estimated by token type. The line is the cost Claude Code reported.</p>
         <div id="legend-s-cost" class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-(--ink-2)"></div>
         <div class="chart-box mt-2 h-64"><canvas id="c-s-cost"></canvas></div>
       </section>
