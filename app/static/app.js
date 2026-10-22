@@ -118,6 +118,16 @@ const valueLabelsPlugin = {
 };
 Chart.register(refLinePlugin, valueLabelsPlugin);
 
+// 'index' mode with the index taken from the 'est' stack only: other series have their own x positions, so
+// their indexes don't line up.
+Chart.Interaction.modes.estIndex = (chart, e) => {
+  const metas = chart.getSortedVisibleDatasetMetas().filter((m) => chart.data.datasets[m.index].stack === 'est');
+  const pts = metas[0]?.data ?? [];
+  let i = -1;
+  pts.forEach((p, j) => { if (i < 0 || Math.abs(p.x - e.x) < Math.abs(pts[i].x - e.x)) i = j; });
+  return i < 0 ? [] : metas.map((m) => ({ element: m.data[i], datasetIndex: m.index, index: i }));
+};
+
 const charts = {};
 const hidden = {}; // chartId -> Set of hidden dataset labels, kept across refreshes
 
@@ -569,10 +579,10 @@ function renderSession() {
   }
   const comps = COMPONENTS.map((c, i) => [...c, i]).filter(([k]) => running[k] > 0 || k !== 'web_search');
   const datasets = comps.map(([k, label, i], n) => lineDS(label, series[k], P.s[i], {
-    fill: n === 0 ? 'origin' : '-1', backgroundColor: P.s[i], borderColor: P.s[i], borderWidth: 0, stack: 'est', pointHoverRadius: 0,
+    fill: n === 0 ? 'origin' : '-1', backgroundColor: P.s[i], borderColor: P.s[i], borderWidth: 0, stack: 'est', pointHoverRadius: 0, stepped: 'before',
   }));
   if (events.length) {
-    datasets.push(lineDS('Reported', events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd })), P.ink, { stack: 'billed', stepped: 'before' }));
+    datasets.push(lineDS('Reported', events.map((e) => ({ x: Date.parse(e.ts), y: e.cost_usd })), P.ink, { stack: 'billed', stepped: 'before', order: -1 }));
   }
   const billedAt = (x) => { let v = null; for (const e of events) { if (Date.parse(e.ts) <= x) v = e.cost_usd; else break; } return v; };
   draw('c-s-cost', {
@@ -588,6 +598,7 @@ function renderSession() {
             footer: (items) => { const x = items[0].parsed.x; const b = billedAt(x); const e = comps.reduce((a, [k]) => a + series[k][items[0].dataIndex].y, 0); return `Estimated ${usd(e)}` + (b != null ? ` · reported ${usd(b)}` : ''); },
           },
         } }),
+      interaction: { mode: 'estIndex', intersect: false },
     },
   });
   legend('legend-s-cost', 'c-s-cost');
