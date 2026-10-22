@@ -55,9 +55,10 @@ The database at `~/.claude/usage/` is kept. Delete it yourself if you want the d
 | Source | Data |
 |---|---|
 | Statusline JSON, on each refresh where the session cost changed | Session cost as Claude Code reports it (`cost.total_cost_usd`), duration, lines added/removed |
+| Statusline JSON, on each refresh where the plan limits changed (Pro and Max plans only) | 5-hour and weekly limit use (`rate_limits.five_hour` / `seven_day`: percent used, reset time) |
 | Session transcripts (`~/.claude/projects/**.jsonl`), main thread and subagents | Per-request tokens: input, cache writes (5m / 1h), cache reads, output, thinking, web searches |
 
-Cost tracking starts when you install. Transcripts carry tokens but not cost, so imported history gets an *estimated* cost: tokens × the prices in [`app/pricing.json`](app/pricing.json).
+Cost and limit tracking start when you install. Transcripts carry tokens but not cost, so imported history gets an *estimated* cost: tokens × the prices in [`app/pricing.json`](app/pricing.json).
 
 ## Reading the dashboard
 
@@ -69,6 +70,12 @@ Cost tracking starts when you install. Transcripts carry tokens but not cost, so
   They differ slightly, because some calls are charged but never logged to the transcript, mainly compaction summaries.
 - **"Tracked data only"** (on by default) limits the view to data the reported cost fully covers. In this mode the cost appears as a single number, and its token-type split adds up to it exactly. Charged cost with no transcript tokens shows as a gray "Not in transcripts" part.
 - **Click a session** in the table to see its context size per request (drops are compactions) and its running cost.
+- **Subscription value** appears only on a Pro or Max plan, after the tracker has recorded the plan's limits. API accounts never see it. It covers the whole account for the last 12 weeks, so the filters don't apply to it.
+  - **Value per week** compares each weekly limit window's reported cost with what your plan costs per week. Set your plan's monthly price next to the section heading.
+  - **Dollars per 1%** shows how much reported cost each 1% of the weekly limit bought. Multiply by 100 for what a full week is worth.
+  - Spend after you reach the 5-hour or weekly limit is extra usage, which you pay for apart from the plan. It is shown apart, and isn't counted as plan value.
+  - Usage that this tracker doesn't see still uses the limits: claude.ai, other machines, and sessions without the statusline (`claude -p`, the SDK). That makes the dollars per 1% look lower than they are.
+  - The first week is partial: it starts when the tracker first recorded the limits.
 
 ## Command line
 
@@ -81,6 +88,7 @@ python3 tracker/track.py backfill       # re-import token usage from transcripts
 ## Configuration
 
 - **Prices:** edit `app/pricing.json` (USD per million tokens). The dashboard reloads it automatically.
+- **Plan price:** set it in the Subscription value section. Your browser stores it.
 - **Port:** change `127.0.0.1:10001` in `docker-compose.yml`.
 - **Auto-compact line:** the context charts mark each session's auto-compact window, which the tracker records from `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else `autoCompactWindow` (per model under `modelSettings`, where `/autocompact` saves it) in your managed, project, and user settings, else the model's context window. The daily chart uses the most recent session's window. The tracker can't see a window passed with `--autocompact`.
 - **Config directory:** `CLAUDE_CONFIG_DIR` is respected by the installer, the tracker, and the Docker mount.

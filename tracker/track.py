@@ -8,10 +8,12 @@
   track.py day [DATE] # sessions billed on one local day (YYYY-MM-DD, default today)
 
 Cost comes from Claude Code itself (statusline cost.total_cost_usd). Per-request token
-usage comes from the session transcript (+ subagent transcripts), deduped by requestId.
+usage comes from the session transcript (+ subagent transcripts), deduped by requestId. Pro/Max plan limits
+(5-hour and weekly use) come from the statusline's rate_limits; API accounts don't get them.
 """
 import glob
 import json
+import math
 import os
 import re
 import sqlite3
@@ -49,6 +51,15 @@ CREATE TABLE IF NOT EXISTS cost_events (
     delta_usd  REAL          -- cost added since the previous event
 );
 CREATE INDEX IF NOT EXISTS cost_events_ts ON cost_events(ts);
+CREATE TABLE IF NOT EXISTS rate_limits (
+    session_id          TEXT,
+    ts                  TEXT,
+    five_hour_pct       REAL,     -- Pro/Max plan limits, account-wide, as of this session's latest response
+    five_hour_resets_at INTEGER,  -- unix seconds
+    seven_day_pct       REAL,
+    seven_day_resets_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS rate_limits_session ON rate_limits(session_id, ts);
 CREATE TABLE IF NOT EXISTS requests (
     request_id     TEXT PRIMARY KEY,
     session_id     TEXT,
@@ -210,6 +221,20 @@ def compact_window(d):
     return min(window, size) if window and size else window or size
 
 
+def plan_limits(d):
+    """(five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at) from the statusline's rate_limits,
+    or None when neither window is there: API accounts never get them, and spend_limit isn't a plan limit."""
+    rl = d.get("rate_limits")
+    number = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    out = []
+    for key in ("five_hour", "seven_day"):
+        w = rl.get(key) if isinstance(rl, dict) else None
+        w = w if isinstance(w, dict) else {}
+        pct, resets = number(w.get("used_percentage")), number(w.get("resets_at"))
+        out += [float(pct) if pct is not None else None, int(resets) if resets is not None else None]
+    return tuple(out) if any(v is not None for v in out) else None
+
+
 def record():
     d = json.load(sys.stdin)
     sid = d.get("session_id")
@@ -217,17 +242,21 @@ def record():
         return
     cost = d.get("cost") or {}
     raw = float(cost.get("total_cost_usd") or 0)
-    # The statusline refreshes far more often than requests happen: only touch the DB when the cost changed.
+    limits = plan_limits(d)
+    # The statusline refreshes far more often than requests happen: only touch the DB when the cost or the plan
+    # limits changed. Both change only when this session gets a response, so an idle session never writes the
+    # stale limits it still holds.
+    key = repr((raw, limits))
     state = os.path.join(STATE, os.path.basename(sid))
     try:
         with open(state) as f:
-            if f.read().strip() == repr(raw):
+            if f.read().strip() == key:
                 return
     except OSError:
         pass
     os.makedirs(STATE, exist_ok=True)
     with open(state, "w") as f:
-        f.write(repr(raw))
+        f.write(key)
     ts = now_iso()
     db = connect()
     with db:
@@ -258,6 +287,11 @@ def record():
                   ts if total > 0 else None, ts if total > 0 else None, compact_window(d), changed))
         if changed:
             db.execute("INSERT INTO cost_events VALUES (?,?,?,?)", (sid, ts, total, total - total_prev))
+        # A blocked request costs nothing but still moves the limits, so they get their own table.
+        if limits and limits != db.execute("""
+                SELECT five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at FROM rate_limits
+                WHERE session_id = ? ORDER BY ts DESC LIMIT 1""", (sid,)).fetchone():
+            db.execute("INSERT INTO rate_limits VALUES (?,?,?,?,?,?)", (sid, ts, *limits))
         tp = d.get("transcript_path")
         if tp and tp.endswith(".jsonl"):
             ingest_session(db, tp)

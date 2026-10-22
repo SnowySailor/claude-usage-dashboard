@@ -26,6 +26,7 @@ const state = {
   auto: store.get('auto', true), tracked: store.get('tracked', true), sort: { key: 'last', dir: -1 }, shown: 25, data: null, session: null,
   // Session chart window. end: null follows the latest request; span: null starts at the first one.
   sid: null, bounds: null, win: { end: null, span: null },
+  planMonthly: store.get('planMonthly', 200),
 };
 
 // ---------- formatting ----------
@@ -40,9 +41,12 @@ const usd = (v) => {
 };
 const usdAxis = (v) => (v >= 1000 ? '$' + compactFmt.format(v) : '$' + nf({ maximumFractionDigits: v < 10 ? 2 : 0 }).format(v));
 const pct = (v, d = 0) => (v == null ? '—' : (v * 100).toFixed(d) + '%');
+const times = (v) => nf({ minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(v) + '×';
 const fmtDay = (s) => new Date(s + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 const fmtDate = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 const fmtTs = (iso) => new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const fmtWeekday = (iso) => new Date(iso).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+const fmtClock = (iso) => new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 const fmtDur = (ms) => {
   if (!ms) return '—';
   const m = Math.round(ms / 60000);
@@ -100,14 +104,20 @@ const refLinePlugin = {
     c.beginPath(); c.moveTo(left, py); c.lineTo(right, py); c.stroke();
     c.fillStyle = P.ink2;
     c.font = '12px system-ui, sans-serif';
-    c.textAlign = 'right';
-    c.textBaseline = 'bottom';
-    c.fillText(opts.label, right - 4, py - 3);
+    if (opts.outside) {  // past the plot's right edge, in the layout padding, where no bar can cover it
+      c.textAlign = 'left';
+      c.textBaseline = 'middle';
+      c.fillText(opts.label, right + 6, py);
+    } else {
+      c.textAlign = 'right';
+      c.textBaseline = 'bottom';
+      c.fillText(opts.label, right - 4, py - 3);
+    }
     c.restore();
   },
 };
 
-// Value at the tip of each horizontal bar (single-dataset charts).
+// Value at the tip of each horizontal bar (single-dataset charts), or with `above`, on the cap of each column's stack.
 const valueLabelsPlugin = {
   id: 'valueLabels',
   afterDatasetsDraw(chart, _args, opts) {
@@ -116,10 +126,19 @@ const valueLabelsPlugin = {
     c.save();
     c.font = '12px system-ui, sans-serif';
     c.fillStyle = P.ink2;
-    c.textBaseline = 'middle';
-    c.textAlign = 'left';
-    const data = chart.data.datasets[0].data;
-    chart.getDatasetMeta(0).data.forEach((bar, i) => c.fillText(opts.format(data[i], i), bar.x + 6, bar.y));
+    if (opts.above) {
+      c.textBaseline = 'bottom';
+      c.textAlign = 'center';
+      chart.getDatasetMeta(0).data.forEach((bar, i) => {
+        const total = chart.data.datasets.reduce((a, ds, j) => a + (chart.isDatasetVisible(j) ? ds.data[i] || 0 : 0), 0);
+        c.fillText(opts.format(total, i), bar.x, chart.scales.y.getPixelForValue(total) - 4);
+      });
+    } else {
+      c.textBaseline = 'middle';
+      c.textAlign = 'left';
+      const data = chart.data.datasets[0].data;
+      chart.getDatasetMeta(0).data.forEach((bar, i) => c.fillText(opts.format(data[i], i), bar.x + 6, bar.y));
+    }
     c.restore();
   },
 };
@@ -156,25 +175,31 @@ function draw(id, config) {
   return charts[id];
 }
 
+// One button per label: datasets that share a label show and hide together.
 function legend(elId, chartId) {
   const chart = charts[chartId];
   const el = document.getElementById(elId);
   el.innerHTML = '';
-  chart.data.datasets.forEach((ds, i) => {
-    const on = chart.isDatasetVisible(i);
+  [...new Set(chart.data.datasets.map((ds) => ds.label))].forEach((label) => {
+    const idx = chart.data.datasets.flatMap((ds, i) => (ds.label === label ? [i] : []));
+    const ds = chart.data.datasets[idx[0]];
+    const on = chart.isDatasetVisible(idx[0]);
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'flex items-center gap-1.5 hover:text-(--ink)';
     b.style.opacity = on ? 1 : 0.45;
     b.title = on ? 'Hide series' : 'Show series';
-    const sw = ds.type === 'line' && !ds.fill
-      ? `<span class="swatch" style="height:2px;width:14px;border-radius:1px;background:${ds.borderColor}"></span>`
-      : ds.type === 'scatter'
-        ? `<span class="swatch" style="border-radius:50%;background:${ds.backgroundColor}"></span>`
-        : `<span class="swatch" style="background:${ds.backgroundColor}"></span>`;
+    const fill = ds.swatch ?? ds.backgroundColor;
+    const sw = ds.type === 'line' && ds.borderDash
+      ? `<span class="swatch" style="height:0;width:14px;border-radius:0;border-top:2px dashed ${ds.borderColor}"></span>`
+      : ds.type === 'line' && !ds.fill
+        ? `<span class="swatch" style="height:2px;width:14px;border-radius:1px;background:${ds.borderColor}"></span>`
+        : ds.type === 'scatter'
+          ? `<span class="swatch" style="border-radius:50%;background:${fill}"></span>`
+          : `<span class="swatch" style="background:${fill}"></span>`;
     b.innerHTML = sw + esc(ds.label);
     b.onclick = () => {
-      chart.setDatasetVisibility(i, !on);
+      idx.forEach((i) => chart.setDatasetVisibility(i, !on));
       const set = (hidden[chartId] ||= new Set());
       on ? set.add(ds.label) : set.delete(ds.label);
       chart.update();
@@ -213,7 +238,7 @@ function tooltip(extra = {}) {
   };
 }
 
-function options({ stacked = false, yFmt = compact, tip = {}, x = {}, y = {}, plugins = {}, horizontal = false, padRight = 0 } = {}) {
+function options({ stacked = false, yFmt = compact, tip = {}, x = {}, y = {}, plugins = {}, horizontal = false, padRight = 0, padTop = 0 } = {}) {
   const valueAxis = {
     stacked, beginAtZero: true, grid: { color: P.grid, drawTicks: false }, border: { display: false },
     ticks: { color: P.muted, callback: yFmt, maxTicksLimit: 6, padding: 6 }, ...y,
@@ -223,7 +248,7 @@ function options({ stacked = false, yFmt = compact, tip = {}, x = {}, y = {}, pl
     ticks: { color: P.muted, maxRotation: 0, autoSkip: true, autoSkipPadding: 12 }, ...x,
   };
   return {
-    responsive: true, maintainAspectRatio: false, animation: false, layout: { padding: { right: padRight } },
+    responsive: true, maintainAspectRatio: false, animation: false, layout: { padding: { right: padRight, top: padTop } },
     indexAxis: horizontal ? 'y' : 'x',
     interaction: horizontal ? { mode: 'nearest', axis: 'y', intersect: false } : { mode: 'index', intersect: false },
     plugins: { legend: { display: false }, tooltip: tooltip(tip), ...plugins },
@@ -272,6 +297,7 @@ function render() {
   if (!d) return;
   syncControls(d);
   renderKpis(d);
+  renderSubscription(d);
   renderDailyCost(d);
   renderComponents(d);
   renderModels(d);
@@ -338,6 +364,122 @@ function renderKpis(d) {
   el.classList.toggle('lg:grid-cols-6', tiles.length === 6);
   el.classList.toggle('lg:grid-cols-5', tiles.length === 5);
   el.innerHTML = tiles.join('');
+}
+
+// ---------- subscription value (Pro/Max plan limits; null for API accounts) ----------
+function weekRange(w) {
+  const a = new Date(w.start), b = new Date(w.end);
+  const range = a.getMonth() === b.getMonth() ? `${fmtDate(a)}–${b.getDate()}` : `${fmtDate(a)} – ${fmtDate(b)}`;
+  return range + (w.current ? ', so far' : w.partial ? ', partial' : '');
+}
+
+// Axis label: the week's start date, which fits under a bar.
+const weekTick = (w) => (w.current ? [fmtDate(Date.parse(w.start)), 'so far'] : w.partial ? [fmtDate(Date.parse(w.start)), 'partial'] : fmtDate(Date.parse(w.start)));
+
+function renderSubscription(d) {
+  const s = d.subscription;
+  $('#sub').hidden = !s?.weeks?.length;
+  if ($('#sub').hidden) return;
+  const now = Date.now();
+  const perWeek = (state.planMonthly * 12) / 52;
+  const weeks = s.weeks;
+  const cur = weeks.find((w) => w.current);
+
+  const week = s.current.seven_day;
+  let weekSub = week ? `resets ${fmtWeekday(week.resets_at)}` : 'no use this week';
+  if (week) {
+    const begun = Date.parse(week.resets_at) - 7 * 86_400_000;
+    const elapsed = now - begun;
+    if (elapsed >= 86_400_000 && week.pct > 0) {
+      const pace = (week.pct * 7 * 86_400_000) / elapsed;
+      weekSub += pace >= 100 ? ` · on pace to reach it ${fmtWeekday(begun + (elapsed * 100) / week.pct)}` : ` · on pace for ${pace.toFixed(0)}%`;
+    }
+  }
+  const five = s.current.five_hour;
+  const hits = `limit reached in ${int(s.five_hour.hits)} of ${int(s.five_hour.windows)} windows`;
+  const share = s.five_hour.week_share;
+  const days = Math.max(7, (now - Date.parse(s.since)) / 86_400_000);
+  const paid = (state.planMonthly * 12 * days) / 365;
+  $('#sub-tiles').innerHTML = [
+    tile('This week', cur ? usd(cur.within) : '—', cur ? `${times(cur.within / perWeek)} the plan's weekly cost` : 'no use this week'),
+    tile('Weekly limit', week ? `${week.pct.toFixed(0)}%` : '—', weekSub),
+    tile('5-hour limit', five ? `${five.pct.toFixed(0)}%` : '—', five ? `resets ${fmtClock(five.resets_at)} · ${hits}` : hits),
+    tile('Per 1% of weekly limit', s.per_pct ? usd(s.per_pct) : '—',
+      s.per_pct ? `a full week ≈ $${int(100 * s.per_pct)}, ${times((100 * s.per_pct) / perWeek)} the plan's weekly cost` : 'needs a week with 10% or more used'),
+    tile('One 5-hour window', share ? `${share.toFixed(1)}%` : '—',
+      share ? `of the weekly limit · about ${Math.floor(100 / share)} full windows a week` : 'needs more 5-hour windows'),
+    tile(`Since ${fmtDate(Date.parse(s.since))}`, usd(s.within_since), `${times(s.within_since / paid)} the ${usd(paid)} the plan cost`),
+  ].join('');
+
+  // Value per week: within the limits vs. extra usage, against the plan's weekly cost.
+  const fade = (color) => weeks.map((w) => (w.current ? color + '80' : color));
+  const datasets = [barDS('Within limits', weeks.map((w) => w.within), P.s[0], { backgroundColor: fade(P.s[0]), hoverBackgroundColor: fade(P.s[0]), swatch: P.s[0] })];
+  if (weeks.some((w) => w.over > 0.005)) {
+    datasets.push(barDS('Over a limit', weeks.map((w) => w.over), P.s[1], { backgroundColor: fade(P.s[1]), hoverBackgroundColor: fade(P.s[1]), swatch: P.s[1] }));
+  }
+  const planLabel = `Plan ${usdAxis(perWeek)}/wk`;
+  draw('c-sub-weeks', {
+    type: 'bar',
+    data: { labels: weeks.map(weekTick), datasets },
+    options: options({
+      stacked: true, yFmt: usdAxis, padTop: 18, padRight: 12 + planLabel.length * 7,
+      y: { suggestedMax: Math.max(perWeek * 1.15, ...weeks.map((w) => w.within + w.over)) },
+      plugins: { refLine: { value: perWeek, label: planLabel, outside: true }, valueLabels: { above: true, format: (_, i) => times(weeks[i].within / perWeek) } },
+      tip: {
+        itemSort: (a, b) => b.datasetIndex - a.datasetIndex,
+        callbacks: {
+          title: (items) => weekRange(weeks[items[0].dataIndex]),
+          label: (c) => ` ${c.dataset.label}: ${usd(c.parsed.y)}`,
+          footer: (items) => {
+            const w = weeks[items[0].dataIndex];
+            return [`${times(w.within / perWeek)} the plan's weekly cost`, `Weekly limit ${w.pct_first.toFixed(0)}% → ${w.pct_last.toFixed(0)}%`]
+              .concat(w.per_pct ? [`${usd(w.per_pct)} per 1%`] : []);
+          },
+        },
+      },
+    }),
+  });
+  legend('legend-sub-weeks', 'c-sub-weeks');
+  $('#t-sub-weeks').innerHTML =
+    '<thead class="sticky top-0 bg-(--surface) text-(--muted)"><tr class="border-b border-(--grid)"><th class="py-1 pr-3 text-left font-medium">Week</th>' +
+    '<th class="pr-3 font-medium">Within limits</th><th class="pr-3 font-medium">Over a limit</th><th class="pr-3 font-medium">× plan</th>' +
+    '<th class="pr-3 font-medium">Weekly limit used</th><th class="font-medium">Per 1%</th></tr></thead><tbody>' +
+    weeks.slice().reverse().map((w) => `<tr class="border-b border-(--grid)"><td class="py-1 pr-3 text-left">${esc(weekRange(w))}</td>` +
+      `<td class="pr-3">${usd(w.within)}</td><td class="pr-3">${usd(w.over)}</td><td class="pr-3">${times(w.within / perWeek)}</td>` +
+      `<td class="pr-3">${w.pct_first.toFixed(0)}% → ${w.pct_last.toFixed(0)}%</td><td>${usd(w.per_pct)}</td></tr>`).join('') + '</tbody>';
+
+  // Dollars per 1%: this week highlighted, the five weeks before it as gray context, and the average rate.
+  const shown = weeks.slice(-6).sort((a, b) => b.current - a.current);
+  const lines = shown.map((w) => lineDS(w.current ? 'This week' : 'Earlier weeks', w.points.map(([x, y]) => ({ x, y })),
+    w.current ? P.s[0] : P.muted, { week: w, order: w.current ? -1 : 0 }));
+  if (s.per_pct) {
+    const top = Math.max(...shown.flatMap((w) => w.points.map((p) => p[0])));
+    lines.push(lineDS('Average rate', [{ x: 0, y: 0 }, { x: top, y: top * s.per_pct }], P.ink2,
+      { borderWidth: 1.5, borderDash: [5, 4], pointHoverRadius: 0, pointHitRadius: 0, order: -2 }));
+  }
+  $('#sub-rate-sub').textContent = s.rolling
+    ? 'The weekly limit looks like a rolling window here, so week-by-week rates are hidden.'
+    : 'Each line is one week. The steeper the line, the more each 1% of the limit was worth.';
+  draw('c-sub-rate', {
+    type: 'line',
+    data: { datasets: lines },
+    options: {
+      ...options({
+        yFmt: usdAxis,
+        x: { type: 'linear', min: 0, max: 100, grid: { display: false }, border: { color: P.axis }, ticks: { color: P.muted, maxTicksLimit: 6, callback: (v) => `${v}%` } },
+        tip: {
+          filter: (item) => item.dataset.week,
+          callbacks: {
+            title: (items) => weekRange(items[0].dataset.week),
+            label: (c) => ` ${c.parsed.x.toFixed(1)}% used · ${usd(c.parsed.y)}`,
+            footer: (items) => (items[0].dataset.week.per_pct ? `${usd(items[0].dataset.week.per_pct)} per 1%` : ''),
+          },
+        },
+      }),
+      interaction: { mode: 'nearest', intersect: false },
+    },
+  });
+  legend('legend-sub-rate', 'c-sub-rate');
 }
 
 // [key, label, color] for each cost part with data; the unlogged remainder only in tracked-only mode.
@@ -767,6 +909,17 @@ document.querySelectorAll('#tokens-mode button').forEach((b) => b.addEventListen
   store.set('tokensMode', state.tokensMode);
   render();
 }));
+$('#plan-price').value = state.planMonthly;
+$('#plan-price').addEventListener('change', (e) => {
+  const v = Number(e.target.value);
+  if (Number.isFinite(v) && v > 0) {
+    state.planMonthly = v;
+    store.set('planMonthly', v);
+    if (state.data) renderSubscription(state.data);
+  } else {
+    e.target.value = state.planMonthly;
+  }
+});
 $('#tracked').addEventListener('change', (e) => { state.tracked = e.target.checked; store.set('tracked', state.tracked); state.shown = 25; refresh(); });
 $('#auto').addEventListener('change', (e) => { state.auto = e.target.checked; store.set('auto', state.auto); });
 $('#refresh').addEventListener('click', refresh);

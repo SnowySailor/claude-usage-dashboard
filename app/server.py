@@ -11,6 +11,7 @@ each request's token counts x pricing.json.
 import json
 import os
 import sqlite3
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PRICING_PATH = os.path.join(HERE, "pricing.json")
 STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("PORT", "8000"))
+
+WEEK, FIVE_HOURS = 7 * 86400, 5 * 3600
+AT_LIMIT = 99.5      # plan limit use (%) that counts as having reached the limit
+RECENT = 12 * WEEK   # how far back the subscription section looks
 
 TOKENS = ("input", "cache_write_5m", "cache_write_1h", "cache_read", "output")
 COMPONENTS = TOKENS + ("web_search",)
@@ -339,6 +344,159 @@ def dashboard(q):
                              key=lambda x: -max(x["est"], x["actual"] or 0)),
         "hourly": [{"hour": h, "est": est_of(hourly[h]), "requests": hourly[h]["requests"]} for h in range(24)],
         "sessions": session_rows,
+        "subscription": subscription(),
+    }
+
+
+def limit_windows(readings, length):
+    """Group (t, session_id, pct, resets_at, extra) readings of one plan limit into its windows, oldest first:
+    {start, end, readings: [(t, pct, extra)]}. A window is the readings that share a reset time (to within an hour).
+    Concurrent sessions can store readings out of order, so a reading below an earlier one in the same window is
+    dropped. One session's own readings only go down when the limit resets, so a drop of more than 5 points from
+    that session's previous reading starts a new window. Also returns whether the windows overlap like rolling ones."""
+    groups = []
+    for t, sid, pct, resets, extra in readings:
+        g = next((g for g in reversed(groups) if abs(resets - g["first_reset"]) <= 3600), None)
+        if g is None or pct < g["seen"].get(sid, pct) - 5:
+            g = {"first_reset": resets, "end": resets, "peak": pct, "readings": [], "seen": {}}
+            groups.append(g)
+        g["seen"][sid] = pct
+        g["end"] = max(g["end"], resets)
+        if pct >= g["peak"]:
+            g["readings"].append((t, pct, extra))
+            g["peak"] = pct
+    groups.sort(key=lambda g: (g["end"], g["readings"][0][0]))
+    ends = [g["end"] for g in groups]
+    rolling = any(3600 < b - a < length - 3600 for a, b in zip(ends, ends[1:]))
+    for a, b in zip(groups, groups[1:]):
+        if b["end"] - a["end"] <= 3600:  # reset early without a new reset time: a ended when b began
+            a["end"] = b["readings"][0][0]
+    prev = None
+    for g in groups:
+        g["start"] = g["end"] - length if prev is None else max(g["end"] - length, prev)
+        g["times"] = [r[0] for r in g["readings"]]
+        prev = g["end"]
+    return groups, rolling
+
+
+def fixed_windows(readings, length, anchor):
+    """Back-to-back windows of the given length that end at anchor, for a limit whose reset time keeps moving."""
+    groups = defaultdict(list)
+    for t, _sid, pct, _resets, extra in readings:
+        groups[int((anchor - t) // length)].append((t, pct, extra))
+    return [{"start": anchor - (k + 1) * length, "end": anchor - k * length, "readings": groups[k],
+             "times": [r[0] for r in groups[k]]} for k in sorted(groups, reverse=True)]
+
+
+def subscription():
+    """Pro/Max plan limits next to the reported cost: value per week, dollars per 1% of the weekly limit and 5-hour
+    window stats. None when there are no plan limit readings in the last 12 weeks, so API accounts never see it."""
+    def load(db):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rate_limits'").fetchone():
+            return None
+        limits = db.execute("SELECT * FROM rate_limits ORDER BY ts").fetchall()
+        if not limits:
+            return None
+        return (limits,
+                db.execute("SELECT session_id, ts, delta_usd FROM cost_events WHERE ts >= ? ORDER BY ts",
+                           (limits[0]["ts"],)).fetchall(),
+                dict(db.execute("SELECT session_id, MIN(ts) FROM cost_events GROUP BY session_id").fetchall()),
+                dict(db.execute("SELECT session_id, MIN(ts) FROM requests GROUP BY session_id").fetchall()))
+
+    try:
+        data = read(load)
+        return plan_value(*data) if data else None
+    except Exception as e:  # the rest of the dashboard must not fail with it
+        print(f"subscription: {e!r}", flush=True)
+        return None
+
+
+def plan_value(limits, events, first_event, first_request):
+    now = datetime.now(timezone.utc).timestamp()
+    since = limits[0]["ts"]
+    since_t = parse_ts(since).timestamp()
+    iso = lambda t: utc_iso(datetime.fromtimestamp(t, timezone.utc))
+    plan_sessions = {r["session_id"] for r in limits}
+    # Only sessions on the plan count (not API-key sessions on the same machine), and not a session's first event
+    # when the session began before the limit data: that event carries all its earlier spend.
+    carried = lambda e: e["ts"] == first_event.get(e["session_id"]) and first_request.get(e["session_id"], e["ts"]) < since
+    spend = [(parse_ts(e["ts"]).timestamp(), e["delta_usd"]) for e in events
+             if e["session_id"] in plan_sessions and not carried(e)]
+
+    rows = [(parse_ts(r["ts"]).timestamp(), r) for r in limits]
+    weekly = [(t, r["session_id"], r["seven_day_pct"], r["seven_day_resets_at"], None)
+              for t, r in rows if r["seven_day_pct"] is not None and r["seven_day_resets_at"] is not None]
+    week, rolling = limit_windows(weekly, WEEK)
+    if rolling:
+        week = fixed_windows(weekly, WEEK, week[-1]["end"])
+    five, _ = limit_windows([(t, r["session_id"], r["five_hour_pct"], r["five_hour_resets_at"],
+                              (r["seven_day_pct"], r["seven_day_resets_at"]))
+                             for t, r in rows if r["five_hour_pct"] is not None and r["five_hour_resets_at"] is not None],
+                            FIVE_HOURS)
+
+    def at_limit(windows):
+        """t -> whether the latest reading before t, in the window that holds t, had reached the limit."""
+        ends = [w["end"] for w in windows]
+
+        def check(t):
+            i = bisect_left(ends, t)
+            if i == len(windows) or windows[i]["start"] >= t:
+                return False
+            j = bisect_left(windows[i]["times"], t) - 1
+            return j >= 0 and windows[i]["readings"][j][1] >= AT_LIMIT
+        return check
+
+    # Spend after reaching either limit is extra usage, paid apart from the plan.
+    week_limit, five_limit = at_limit(week), at_limit(five)
+    spend = [(t, usd, week_limit(t) or five_limit(t)) for t, usd in spend]
+    times = [s[0] for s in spend]
+    between = lambda a, b: spend[bisect_right(times, a):bisect_right(times, b)]
+    within_of = lambda evs: sum(usd for _, usd, over in evs if not over)
+
+    weeks, d_usd, d_pct = [], 0.0, 0.0
+    for w in week:
+        rs = w["readings"]
+        k = next((i for i, r in enumerate(rs) if r[1] >= AT_LIMIT), len(rs))
+        per_pct = None
+        if k and rs[k - 1][1] - rs[0][1] >= 10:
+            usd, pct = within_of(between(rs[0][0], rs[k - 1][0])), rs[k - 1][1] - rs[0][1]
+            per_pct = usd / pct
+            d_usd, d_pct = d_usd + usd, d_pct + pct
+        if w["end"] <= now - RECENT:
+            continue
+        evs = between(w["start"], w["end"])
+        points, cum, j = [], 0.0, bisect_right(times, w["start"])
+        for t, pct, _ in rs:
+            while j < len(spend) and spend[j][0] <= min(t, w["end"]):
+                cum += 0 if spend[j][2] else spend[j][1]
+                j += 1
+            points.append([pct, round(cum, 4)])
+        weeks.append({
+            "start": iso(w["start"]), "end": iso(w["end"]),
+            "within": within_of(evs), "over": sum(usd for _, usd, over in evs if over),
+            "pct_first": rs[0][1], "pct_last": rs[-1][1], "per_pct": None if rolling else per_pct,
+            "partial": w["start"] < since_t, "current": w["end"] > now, "points": points,
+        })
+    if not weeks:
+        return None
+
+    recent5 = [w for w in five if w["end"] > now - RECENT]
+    d5 = d7 = 0.0
+    for w in recent5:
+        (_, a5, (a7, a7_reset)), (_, b5, (b7, b7_reset)) = w["readings"][0], w["readings"][-1]
+        if None in (a7, b7, a7_reset, b7_reset) or abs(b7_reset - a7_reset) > 3600 or b7 < a7:
+            continue  # no weekly reading, or the weekly limit reset inside this window
+        d5, d7 = d5 + b5 - a5, d7 + b7 - a7
+    current = lambda ws: ({"pct": ws[-1]["readings"][-1][1], "resets_at": iso(ws[-1]["end"])}
+                          if ws and ws[-1]["end"] > now else None)
+    return {
+        "since": since, "rolling": rolling,
+        "current": {"seven_day": current(week), "five_hour": current(five)},
+        "weeks": weeks,
+        "per_pct": d_usd / d_pct if d_pct and not rolling else None,
+        "within_since": within_of(spend), "over_since": sum(usd for _, usd, over in spend if over),
+        "five_hour": {"windows": len(recent5), "hits": sum(w["readings"][-1][1] >= AT_LIMIT for w in recent5),
+                      "week_share": 100 * d7 / d5 if d5 >= 50 and not rolling else None},
     }
 
 
