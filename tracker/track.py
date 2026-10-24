@@ -18,12 +18,16 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 DB = os.path.join(CLAUDE_DIR, "usage", "usage.db")
 STATE = os.path.join(CLAUDE_DIR, "usage", "state")  # last seen raw cost per session
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+CONFIG = os.path.join(CLAUDE_DIR, ".claude.json") if os.environ.get("CLAUDE_CONFIG_DIR") \
+    else os.path.expanduser("~/.claude.json")
+WEEK = 7 * 86400
 MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json",
                     "/etc/claude-code/managed-settings.json")
 
@@ -48,7 +52,8 @@ CREATE TABLE IF NOT EXISTS cost_events (
     session_id TEXT,
     ts         TEXT,
     cost_usd   REAL,         -- cumulative session cost at ts
-    delta_usd  REAL          -- cost added since the previous event
+    delta_usd  REAL,         -- cost added since the previous event
+    account    TEXT          -- accounts.account the session was on
 );
 CREATE INDEX IF NOT EXISTS cost_events_ts ON cost_events(ts);
 CREATE TABLE IF NOT EXISTS rate_limits (
@@ -57,9 +62,16 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     five_hour_pct       REAL,     -- Pro/Max plan limits, account-wide, as of this session's latest response
     five_hour_resets_at INTEGER,  -- unix seconds
     seven_day_pct       REAL,
-    seven_day_resets_at INTEGER
+    seven_day_resets_at INTEGER,
+    account             TEXT
 );
 CREATE INDEX IF NOT EXISTS rate_limits_session ON rate_limits(session_id, ts);
+CREATE TABLE IF NOT EXISTS accounts (
+    account      TEXT PRIMARY KEY,  -- accountUuid/organizationUuid of the Claude login
+    email        TEXT,
+    organization TEXT,
+    last_seen    TEXT
+);
 CREATE TABLE IF NOT EXISTS requests (
     request_id     TEXT PRIMARY KEY,
     session_id     TEXT,
@@ -112,16 +124,55 @@ LEFT JOIN (
 """
 
 
+COLUMNS = (("sessions", "compact_window", "INTEGER"), ("cost_events", "account", "TEXT"),
+           ("rate_limits", "account", "TEXT"))
+
+
 def connect():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     db = sqlite3.connect(DB, timeout=15)
     db.execute("PRAGMA journal_mode=WAL")
     # IMMEDIATE: concurrent statusline refreshes otherwise race to drop and recreate the view.
     db.executescript("BEGIN IMMEDIATE;" + SCHEMA)
-    if "compact_window" not in {c[1] for c in db.execute("PRAGMA table_info(sessions)")}:
-        db.execute("ALTER TABLE sessions ADD COLUMN compact_window INTEGER")
+    missing = [(t, c, kind) for t, c, kind in COLUMNS if c not in {r[1] for r in db.execute(f"PRAGMA table_info({t})")}]
+    # Rows from before accounts were recorded belong to the account logged in now. Read it before altering
+    # anything, so a config that can't be read leaves the columns missing and the backfill for the next write.
+    account = current_account() if any(c == "account" for _, c, _ in missing) else None
+    for t, c, kind in missing:
+        db.execute(f"ALTER TABLE {t} ADD COLUMN {c} {kind}")
+        if c == "account" and account:
+            db.execute(f"UPDATE {t} SET account = ? WHERE account IS NULL", (account[0],))
+    if account:
+        seen(db, account)
     db.commit()
     return db
+
+
+def current_account():
+    """(key, email, organization) of the Claude login in Claude Code's global config, or None without one (API key).
+    The limits belong to a seat in an organization, so the key is accountUuid/organizationUuid."""
+    for attempt in range(4):
+        try:
+            with open(CONFIG) as f:
+                config = json.load(f)
+            break
+        except FileNotFoundError:
+            return None
+        except ValueError:  # Claude Code is rewriting it
+            if attempt == 3:
+                raise
+            time.sleep(0.05)
+    a = config.get("oauthAccount") if isinstance(config, dict) else None
+    if not isinstance(a, dict) or not a.get("accountUuid"):
+        return None
+    return f"{a['accountUuid']}/{a.get('organizationUuid')}", a.get("emailAddress"), a.get("organizationName")
+
+
+def seen(db, account):
+    db.execute("""
+        INSERT INTO accounts VALUES (?,?,?,?) ON CONFLICT(account) DO UPDATE SET
+            email = excluded.email, organization = excluded.organization, last_seen = excluded.last_seen
+        """, (*account, now_iso()))
 
 
 def now_iso():
@@ -235,6 +286,14 @@ def plan_limits(d):
     return tuple(out) if any(v is not None for v in out) else None
 
 
+def switched(prev_reset, reset):
+    """Whether a session's weekly reset moved by something other than whole weeks: another account answered."""
+    if prev_reset is None or reset is None:
+        return False
+    off = (reset - prev_reset) % WEEK
+    return 3600 < off < WEEK - 3600
+
+
 def record():
     d = json.load(sys.stdin)
     sid = d.get("session_id")
@@ -285,13 +344,26 @@ def record():
                   cost.get("total_duration_ms"), cost.get("total_api_duration_ms"),
                   cost.get("total_lines_added"), cost.get("total_lines_removed"),
                   ts if total > 0 else None, ts if total > 0 else None, compact_window(d), changed))
+        last = db.execute("""
+            SELECT five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, account FROM rate_limits
+            WHERE session_id = ? ORDER BY ts DESC LIMIT 1""", (sid,)).fetchone()
+        # The global config shows the latest login, but a session started before a /login elsewhere can still be
+        # on the old account. So a session keeps its account until its weekly reset moves off its weekly schedule.
+        account = last and last[4]
+        if not account or limits and switched(last[3], limits[3]):
+            current = current_account()
+            account = current and current[0]
+            if current:
+                seen(db, current)
         if changed:
-            db.execute("INSERT INTO cost_events VALUES (?,?,?,?)", (sid, ts, total, total - total_prev))
+            db.execute("INSERT INTO cost_events (session_id, ts, cost_usd, delta_usd, account) VALUES (?,?,?,?,?)",
+                       (sid, ts, total, total - total_prev, account))
         # A blocked request costs nothing but still moves the limits, so they get their own table.
-        if limits and limits != db.execute("""
-                SELECT five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at FROM rate_limits
-                WHERE session_id = ? ORDER BY ts DESC LIMIT 1""", (sid,)).fetchone():
-            db.execute("INSERT INTO rate_limits VALUES (?,?,?,?,?,?)", (sid, ts, *limits))
+        if limits and limits != (last and last[:4]):
+            db.execute("""
+                INSERT INTO rate_limits (session_id, ts, five_hour_pct, five_hour_resets_at, seven_day_pct,
+                                         seven_day_resets_at, account)
+                VALUES (?,?,?,?,?,?,?)""", (sid, ts, *limits, account))
         tp = d.get("transcript_path")
         if tp and tp.endswith(".jsonl"):
             ingest_session(db, tp)

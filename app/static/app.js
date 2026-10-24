@@ -26,7 +26,7 @@ const state = {
   auto: store.get('auto', true), tracked: store.get('tracked', true), sort: { key: 'last', dir: -1 }, shown: 25, data: null, session: null,
   // Session chart window. end: null follows the latest request; span: null starts at the first one.
   sid: null, bounds: null, win: { end: null, span: null },
-  planMonthly: store.get('planMonthly', 200),
+  planPrices: store.get('planPrices', {}), subAccount: store.get('subAccount', null), // '' = all accounts
 };
 
 // ---------- formatting ----------
@@ -130,7 +130,7 @@ const valueLabelsPlugin = {
       c.textBaseline = 'bottom';
       c.textAlign = 'center';
       chart.getDatasetMeta(0).data.forEach((bar, i) => {
-        const total = chart.data.datasets.reduce((a, ds, j) => a + (chart.isDatasetVisible(j) ? ds.data[i] || 0 : 0), 0);
+        const total = chart.data.datasets.reduce((a, ds, j) => a + (ds.type !== 'line' && chart.isDatasetVisible(j) ? ds.data[i] || 0 : 0), 0);
         c.fillText(opts.format(total, i), bar.x, chart.scales.y.getPixelForValue(total) - 4);
       });
     } else {
@@ -376,12 +376,44 @@ function weekRange(w) {
 // Axis label: the week's start date, which fits under a bar.
 const weekTick = (w) => (w.current ? [fmtDate(Date.parse(w.start)), 'so far'] : w.partial ? [fmtDate(Date.parse(w.start)), 'partial'] : fmtDate(Date.parse(w.start)));
 
+const DEFAULT_PRICE = 200;
+const priceOf = (id) => state.planPrices[id] ?? DEFAULT_PRICE;
+const weeklyCost = (monthly) => (monthly * 12) / 52;
+// What the plan cost from the account's first reading until now (or its last, once its weekly window ended).
+const paidFor = (a) => (priceOf(a.id) * 12 * Math.max(7, (Date.parse(a.paid_until) - Date.parse(a.since)) / DAY)) / 365;
+// Fixed color per account, in order of first use. P.s[1] stays with "Over a limit".
+const accountColor = (i) => (i === 0 ? P.s[0] : P.s[i + 1] ?? P.muted);
+
+function setSubTiles(tiles) {
+  const el = $('#sub-tiles');
+  el.classList.toggle('sm:grid-cols-3', tiles.length === 6);
+  el.classList.toggle('lg:grid-cols-6', tiles.length === 6);
+  el.classList.toggle('lg:grid-cols-4', tiles.length === 4);
+  el.innerHTML = tiles.join('');
+}
+
 function renderSubscription(d) {
   const s = d.subscription;
-  $('#sub').hidden = !s?.weeks?.length;
-  if ($('#sub').hidden) return;
+  $('#sub').hidden = !s;
+  if (!s) return;
+  const all = state.subAccount === '' && s.combined;
+  const a = !all && (s.accounts.find((x) => x.id === state.subAccount) ?? s.accounts.find((x) => x.id === s.active));
+  const sel = $('#sub-account');
+  sel.hidden = s.accounts.length < 2;
+  fillSelect(sel, s.accounts.map((x) => x.id), a ? a.id : '', 'All accounts', (id) => s.accounts.find((x) => x.id === id).label);
+  sel.value = a ? a.id : '';
+  $('#plan-price-label').hidden = !a;
+  if (a && document.activeElement !== $('#plan-price')) $('#plan-price').value = priceOf(a.id);
+  $('#plans-total').hidden = !all;
+  $('#plans-total').textContent = `Plans: ${usd(s.accounts.reduce((t, x) => t + priceOf(x.id), 0))}/month`;
+  $('#sub-note').textContent = `${all ? 'All accounts' : 'Whole account'}, last 12 weeks. The filters above don't apply. Dollars are the reported cost at API list prices.`;
+  if (all) renderCombined(s);
+  else renderAccount(a);
+}
+
+function renderAccount(s) {
   const now = Date.now();
-  const perWeek = (state.planMonthly * 12) / 52;
+  const perWeek = weeklyCost(priceOf(s.id));
   const weeks = s.weeks;
   const cur = weeks.find((w) => w.current);
 
@@ -398,9 +430,8 @@ function renderSubscription(d) {
   const five = s.current.five_hour;
   const hits = `limit reached in ${int(s.five_hour.hits)} of ${int(s.five_hour.windows)} windows`;
   const share = s.five_hour.week_share;
-  const days = Math.max(7, (now - Date.parse(s.since)) / 86_400_000);
-  const paid = (state.planMonthly * 12 * days) / 365;
-  $('#sub-tiles').innerHTML = [
+  const paid = paidFor(s);
+  setSubTiles([
     tile('This week', cur ? usd(cur.within) : '—', cur ? `${times(cur.within / perWeek)} the plan's weekly cost` : 'no use this week'),
     tile('Weekly limit', week ? `${week.pct.toFixed(0)}%` : '—', weekSub),
     tile('5-hour limit', five ? `${five.pct.toFixed(0)}%` : '—', five ? `resets ${fmtClock(five.resets_at)} · ${hits}` : hits),
@@ -409,9 +440,10 @@ function renderSubscription(d) {
     tile('One 5-hour window', share ? `${share.toFixed(1)}%` : '—',
       share ? `of the weekly limit · about ${Math.floor(100 / share)} full windows a week` : 'needs more 5-hour windows'),
     tile(`Since ${fmtDate(Date.parse(s.since))}`, usd(s.within_since), `${times(s.within_since / paid)} the ${usd(paid)} the plan cost`),
-  ].join('');
+  ]);
 
   // Value per week: within the limits vs. extra usage, against the plan's weekly cost.
+  $('#sub-weeks-sub').textContent = 'Reported cost in each weekly limit window, against what the plan costs per week. Over a limit is extra usage, paid apart from the plan.';
   const fade = (color) => weeks.map((w) => (w.current ? color + '80' : color));
   const datasets = [barDS('Within limits', weeks.map((w) => w.within), P.s[0], { backgroundColor: fade(P.s[0]), hoverBackgroundColor: fade(P.s[0]), swatch: P.s[0] })];
   if (weeks.some((w) => w.over > 0.005)) {
@@ -457,6 +489,7 @@ function renderSubscription(d) {
     lines.push(lineDS('Average rate', [{ x: 0, y: 0 }, { x: top, y: top * s.per_pct }], P.ink2,
       { borderWidth: 1.5, borderDash: [5, 4], pointHoverRadius: 0, pointHitRadius: 0, order: -2 }));
   }
+  $('#sub-rate-title').textContent = 'Dollars per 1% of the weekly limit';
   $('#sub-rate-sub').textContent = s.rolling
     ? 'The weekly limit looks like a rolling window here, so week-by-week rates are hidden.'
     : 'Each line is one week. The steeper the line, the more each 1% of the limit was worth.';
@@ -480,6 +513,90 @@ function renderSubscription(d) {
     },
   });
   legend('legend-sub-rate', 'c-sub-rate');
+}
+
+// All accounts: calendar weeks, since each account's weekly windows reset at its own time.
+function renderCombined(s) {
+  const accounts = s.accounts;
+  const first = Math.min(...accounts.map((a) => Date.parse(a.since)));
+  const weeks = s.combined.weeks.map((w) => ({ ...w, partial: Date.parse(w.start) < first }));
+  const within = (w) => sum(w.within);
+  const planCost = (w) => w.plans.reduce((t, id) => t + weeklyCost(priceOf(id)), 0);
+  const ofPlans = (w, v) => (planCost(w) ? `${times(v / planCost(w))} the ${w.plans.length === 1 ? "plan's" : "plans'"} weekly cost` : 'no plan this week');
+  const cur = weeks.find((w) => w.current);
+  const rated = accounts.filter((a) => a.per_pct);
+  const fullWeek = rated.reduce((t, a) => t + 100 * a.per_pct, 0);
+  const ratedCost = rated.reduce((t, a) => t + weeklyCost(priceOf(a.id)), 0);
+  const withinSince = accounts.reduce((t, a) => t + a.within_since, 0);
+  const paid = accounts.reduce((t, a) => t + paidFor(a), 0);
+  setSubTiles([
+    tile('This week', cur ? usd(within(cur)) : '—', cur ? ofPlans(cur, within(cur)) : 'no use this week'),
+    tile('A full week of all plans', rated.length ? `$${int(fullWeek)}` : '—', rated.length
+      ? `${times(fullWeek / ratedCost)} their weekly cost` + (rated.length < accounts.length ? ` · ${rated.length} of ${accounts.length} accounts` : '')
+      : 'needs a week with 10% or more used'),
+    tile(`Since ${fmtDate(first)}`, usd(withinSince), `${times(withinSince / paid)} the ${usd(paid)} the plans cost`),
+    tile('Extra usage', usd(accounts.reduce((t, a) => t + a.over_since, 0)), 'paid apart from the plans'),
+  ]);
+
+  // Value per week: each account's spend within its limits, extra usage, and what the plans cost that week.
+  $('#sub-weeks-sub').textContent = 'Reported cost in each calendar week, by account, against what the plans cost per week. Over a limit is extra usage, paid apart from the plans.';
+  const fade = (color) => weeks.map((w) => (w.current ? color + '80' : color));
+  const bar = (label, data, color) => barDS(label, data, color, { backgroundColor: fade(color), hoverBackgroundColor: fade(color), swatch: color });
+  const datasets = accounts.map((a, i) => bar(a.label, weeks.map((w) => w.within[a.id] || 0), accountColor(i)));
+  if (weeks.some((w) => w.over > 0.005)) datasets.push(bar('Over a limit', weeks.map((w) => w.over), P.s[1]));
+  datasets.push(lineDS("Plans' cost", weeks.map(planCost), P.ink2,
+    { stack: 'plans', stepped: 'middle', borderWidth: 1.5, borderDash: [5, 4], pointHoverRadius: 0, pointHitRadius: 0, order: -1 }));
+  draw('c-sub-weeks', {
+    type: 'bar',
+    data: { labels: weeks.map(weekTick), datasets },
+    options: options({
+      stacked: true, yFmt: usdAxis, padTop: 18,
+      y: { suggestedMax: Math.max(...weeks.map((w) => Math.max(planCost(w) * 1.15, within(w) + w.over))) },
+      plugins: { valueLabels: { above: true, format: (_, i) => (planCost(weeks[i]) ? times(within(weeks[i]) / planCost(weeks[i])) : '') } },
+      tip: {
+        filter: (item) => item.dataset.type !== 'line' && item.raw > 0,
+        itemSort: (a, b) => b.datasetIndex - a.datasetIndex,
+        callbacks: {
+          title: (items) => weekRange(weeks[items[0].dataIndex]),
+          label: (c) => ` ${c.dataset.label}: ${usd(c.parsed.y)}`,
+          footer: (items) => {
+            const w = weeks[items[0].dataIndex];
+            return [`Plans' cost ${usd(planCost(w))}`, ofPlans(w, within(w))];
+          },
+        },
+      },
+    }),
+  });
+  legend('legend-sub-weeks', 'c-sub-weeks');
+  const th = (label) => `<th class="pr-3 font-medium">${esc(label)}</th>`;
+  $('#t-sub-weeks').innerHTML =
+    '<thead class="sticky top-0 bg-(--surface) text-(--muted)"><tr class="border-b border-(--grid)"><th class="py-1 pr-3 text-left font-medium">Week</th>' +
+    accounts.map((a) => th(a.label)).join('') + th('Within limits') + th('Over a limit') + th("Plans' cost") +
+    '<th class="font-medium">× plans</th></tr></thead><tbody>' +
+    weeks.slice().reverse().map((w) => `<tr class="border-b border-(--grid)"><td class="whitespace-nowrap py-1 pr-3 text-left">${esc(weekRange(w))}</td>` +
+      accounts.map((a) => `<td class="pr-3">${usd(w.within[a.id] || 0)}</td>`).join('') +
+      `<td class="pr-3">${usd(within(w))}</td><td class="pr-3">${usd(w.over)}</td><td class="pr-3">${usd(planCost(w))}</td>` +
+      `<td>${planCost(w) ? times(within(w) / planCost(w)) : '—'}</td></tr>`).join('') + '</tbody>';
+
+  // A full week of each account: 100 × its average dollars per 1%. Two accounts' % can't be added up.
+  const bars = accounts.flatMap((a, i) => (a.per_pct ? [{ a, color: accountColor(i), full: 100 * a.per_pct }] : []));
+  $('#sub-rate-title').textContent = 'What a full week is worth';
+  $('#sub-rate-sub').textContent = bars.length
+    ? "100% of each account's weekly limit, at its average dollars per 1%, against its plan's weekly cost."
+    : 'Needs a week with 10% or more of the weekly limit used.';
+  draw('c-sub-rate', {
+    type: 'bar',
+    data: {
+      labels: bars.map((b) => b.a.label),
+      datasets: [{ label: 'A full week', data: bars.map((b) => b.full), backgroundColor: bars.map((b) => b.color), borderRadius: 4, borderSkipped: 'start', maxBarThickness: 24 }],
+    },
+    options: options({
+      horizontal: true, yFmt: usdAxis, padRight: 150,
+      tip: { callbacks: { label: (c) => ` ${usd(c.parsed.x)} · ${usd(bars[c.dataIndex].a.per_pct)} per 1%` } },
+      plugins: { valueLabels: { format: (v, i) => `$${int(v)} · ${times(v / weeklyCost(priceOf(bars[i].a.id)))} its plan` } },
+    }),
+  });
+  $('#legend-sub-rate').innerHTML = '';
 }
 
 // [key, label, color] for each cost part with data; the unlogged remainder only in tracked-only mode.
@@ -909,15 +1026,20 @@ document.querySelectorAll('#tokens-mode button').forEach((b) => b.addEventListen
   store.set('tokensMode', state.tokensMode);
   render();
 }));
-$('#plan-price').value = state.planMonthly;
+$('#sub-account').addEventListener('change', (e) => {
+  state.subAccount = e.target.value;
+  store.set('subAccount', state.subAccount);
+  renderSubscription(state.data);
+});
 $('#plan-price').addEventListener('change', (e) => {
+  const id = $('#sub-account').value;
   const v = Number(e.target.value);
   if (Number.isFinite(v) && v > 0) {
-    state.planMonthly = v;
-    store.set('planMonthly', v);
-    if (state.data) renderSubscription(state.data);
+    state.planPrices[id] = v;
+    store.set('planPrices', state.planPrices);
+    renderSubscription(state.data);
   } else {
-    e.target.value = state.planMonthly;
+    e.target.value = priceOf(id);
   }
 });
 $('#tracked').addEventListener('change', (e) => { state.tracked = e.target.checked; store.set('tracked', state.tracked); state.shown = 25; refresh(); });

@@ -344,7 +344,7 @@ def dashboard(q):
                              key=lambda x: -max(x["est"], x["actual"] or 0)),
         "hourly": [{"hour": h, "est": est_of(hourly[h]), "requests": hourly[h]["requests"]} for h in range(24)],
         "sessions": session_rows,
-        "subscription": subscription(),
+        "subscription": subscription(tz),
     }
 
 
@@ -388,38 +388,94 @@ def fixed_windows(readings, length, anchor):
              "times": [r[0] for r in groups[k]]} for k in sorted(groups, reverse=True)]
 
 
-def subscription():
-    """Pro/Max plan limits next to the reported cost: value per week, dollars per 1% of the weekly limit and 5-hour
-    window stats. None when there are no plan limit readings in the last 12 weeks, so API accounts never see it."""
+def subscription(tz):
+    """Pro/Max plan limits next to the reported cost, for each account: value per week, dollars per 1% of the weekly
+    limit and 5-hour window stats, plus calendar weeks of all accounts together. None when there are no plan limit
+    readings in the last 12 weeks, so API accounts never see it."""
     def load(db):
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rate_limits'").fetchone():
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts'").fetchone():
             return None
-        limits = db.execute("SELECT * FROM rate_limits ORDER BY ts").fetchall()
+        limits = db.execute("SELECT * FROM rate_limits WHERE account IS NOT NULL ORDER BY ts").fetchall()
         if not limits:
             return None
         return (limits,
-                db.execute("SELECT session_id, ts, delta_usd FROM cost_events WHERE ts >= ? ORDER BY ts",
+                db.execute("SELECT session_id, ts, delta_usd, account FROM cost_events WHERE ts >= ? ORDER BY ts",
                            (limits[0]["ts"],)).fetchall(),
+                {r[0]: (r[1], r[2]) for r in db.execute("SELECT account, email, organization FROM accounts")},
                 dict(db.execute("SELECT session_id, MIN(ts) FROM cost_events GROUP BY session_id").fetchall()),
                 dict(db.execute("SELECT session_id, MIN(ts) FROM requests GROUP BY session_id").fetchall()))
 
     try:
         data = read(load)
-        return plan_value(*data) if data else None
+        return accounts_value(*data, tz) if data else None
     except Exception as e:  # the rest of the dashboard must not fail with it
         print(f"subscription: {e!r}", flush=True)
         return None
 
 
-def plan_value(limits, events, first_event, first_request):
+def accounts_value(limits, events, info, first_event, first_request, tz):
+    readings, spent = defaultdict(list), defaultdict(list)
+    for r in limits:
+        readings[r["account"]].append(r)
+    for e in events:
+        spent[e["account"]].append(e)
+    accounts, spend = [], {}
+    for key, rows in readings.items():
+        value = plan_value(rows, spent[key], first_event, first_request, limits[0]["ts"])
+        if value:
+            payload, spend[key] = value
+            accounts.append({"id": key, **payload})
+    if not accounts:
+        return None
+    accounts.sort(key=lambda a: a["since"])
+    emails = Counter(info.get(a["id"], (None, None))[0] for a in accounts)
+    for a in accounts:
+        email, org = info.get(a["id"], (None, None))
+        a["label"] = email or org or a["id"][:8]
+        if email and org and emails[email] > 1:
+            a["label"] += f" ({org})"
+    active = limits[-1]["account"]
+    return {
+        "active": active if active in spend else accounts[-1]["id"],
+        "accounts": accounts,
+        "combined": combined_weeks(accounts, spend, tz) if len(accounts) > 1 else None,
+    }
+
+
+def combined_weeks(accounts, spend, tz):
+    """Calendar weeks (Monday 00:00 in tz) of every account's spend. Each account has its own weekly reset, so its
+    limit windows can't be added up. A week's plans are the accounts paid for during some of it."""
+    now = datetime.now(tz)
+    first = min(parse_ts(a["since"]) for a in accounts).timestamp()
+    paid = {a["id"]: (parse_ts(a["since"]).timestamp(), parse_ts(a["paid_until"]).timestamp()) for a in accounts}
+    monday = datetime(now.year, now.month, now.day, tzinfo=tz) - timedelta(days=now.weekday())
+    weeks = []
+    for k in range(RECENT // WEEK):
+        start, end = monday - timedelta(days=7 * k), monday - timedelta(days=7 * (k - 1))
+        s, e = start.timestamp(), end.timestamp()
+        if e <= first:
+            break
+        evs = {key: [x for x in sp if s <= x[0] < e] for key, sp in spend.items()}
+        weeks.append({
+            "start": utc_iso(start), "end": utc_iso(end), "current": e > now.timestamp(),
+            "within": {key: sum(usd for _, usd, over in xs if not over) for key, xs in evs.items()},
+            "over": sum(usd for xs in evs.values() for _, usd, over in xs if over),
+            "plans": [a["id"] for a in accounts if paid[a["id"]][0] < e and paid[a["id"]][1] > s],
+        })
+    return {"weeks": weeks[::-1]}
+
+
+def plan_value(limits, events, first_event, first_request, tracked_since):
+    """One account's payload and its spend [(t, usd, over)], or None without a weekly window in the last 12 weeks."""
     now = datetime.now(timezone.utc).timestamp()
     since = limits[0]["ts"]
     since_t = parse_ts(since).timestamp()
     iso = lambda t: utc_iso(datetime.fromtimestamp(t, timezone.utc))
     plan_sessions = {r["session_id"] for r in limits}
     # Only sessions on the plan count (not API-key sessions on the same machine), and not a session's first event
-    # when the session began before the limit data: that event carries all its earlier spend.
-    carried = lambda e: e["ts"] == first_event.get(e["session_id"]) and first_request.get(e["session_id"], e["ts"]) < since
+    # when the session began before any limit data: that event carries all its earlier spend.
+    carried = lambda e: (e["ts"] == first_event.get(e["session_id"])
+                         and first_request.get(e["session_id"], e["ts"]) < tracked_since)
     spend = [(parse_ts(e["ts"]).timestamp(), e["delta_usd"]) for e in events
              if e["session_id"] in plan_sessions and not carried(e)]
 
@@ -491,13 +547,14 @@ def plan_value(limits, events, first_event, first_request):
                           if ws and ws[-1]["end"] > now else None)
     return {
         "since": since, "rolling": rolling,
+        "paid_until": iso(now) if current(week) else limits[-1]["ts"],
         "current": {"seven_day": current(week), "five_hour": current(five)},
         "weeks": weeks,
         "per_pct": d_usd / d_pct if d_pct and not rolling else None,
         "within_since": within_of(spend), "over_since": sum(usd for _, usd, over in spend if over),
         "five_hour": {"windows": len(recent5), "hits": sum(w["readings"][-1][1] >= AT_LIMIT for w in recent5),
                       "week_share": 100 * d7 / d5 if d5 >= 50 and not rolling else None},
-    }
+    }, spend
 
 
 def session_detail(sid):

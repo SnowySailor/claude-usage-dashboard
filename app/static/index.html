@@ -109,17 +109,21 @@
       <div class="flex flex-wrap items-end justify-between gap-2">
         <div>
           <h2 class="text-lg font-semibold">Subscription value</h2>
-          <p class="text-sm text-(--ink-2)">Whole account, last 12 weeks. The filters above don't apply. Dollars are the reported cost at API list prices.</p>
+          <p id="sub-note" class="text-sm text-(--ink-2)"></p>
         </div>
-        <label class="flex items-center gap-2 text-sm text-(--ink-2)">Plan $/month
-          <input id="plan-price" type="number" min="1" step="1" class="ctl num w-24 px-2 py-1">
-        </label>
+        <div class="flex flex-wrap items-center gap-3 text-sm text-(--ink-2)">
+          <select id="sub-account" class="ctl px-2 py-1.5" aria-label="Account" hidden></select>
+          <label id="plan-price-label" class="flex items-center gap-2">Plan $/month
+            <input id="plan-price" type="number" min="1" step="1" class="ctl num w-24 px-2 py-1">
+          </label>
+          <span id="plans-total" class="num" hidden></span>
+        </div>
       </div>
       <div id="sub-tiles" class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6"></div>
       <div class="mt-4 grid gap-4 lg:grid-cols-2">
         <section class="card p-4">
           <h3 class="font-semibold">Value per week</h3>
-          <p class="text-sm text-(--ink-2)">Reported cost in each weekly limit window, against what the plan costs per week. Over a limit is extra usage, paid apart from the plan.</p>
+          <p id="sub-weeks-sub" class="text-sm text-(--ink-2)"></p>
           <div id="legend-sub-weeks" class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm text-(--ink-2)"></div>
           <div class="chart-box mt-2 h-64"><canvas id="c-sub-weeks"></canvas></div>
           <details class="mt-3 text-sm">
@@ -128,7 +132,7 @@
           </details>
         </section>
         <section class="card p-4">
-          <h3 class="font-semibold">Dollars per 1% of the weekly limit</h3>
+          <h3 id="sub-rate-title" class="font-semibold"></h3>
           <p id="sub-rate-sub" class="text-sm text-(--ink-2)"></p>
           <div id="legend-sub-rate" class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm text-(--ink-2)"></div>
           <div class="chart-box mt-2 h-64"><canvas id="c-sub-rate"></canvas></div>
