@@ -219,7 +219,13 @@ def ingest_file(db, path, agent_id=None):
             u.get("speed"), u.get("service_tier"),
         ))
     # A request is logged once per content block; later entries carry the final usage, so REPLACE keeps the last.
-    db.executemany("INSERT OR REPLACE INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    # A request another session already owns stays there: a background handoff copies it into the new transcript
+    # with its usage zeroed.
+    db.executemany("""
+        INSERT OR REPLACE INTO requests
+        SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16
+        WHERE NOT EXISTS (SELECT 1 FROM requests WHERE request_id = ?1 AND session_id != ?2)
+        """, rows)
     db.execute("INSERT OR REPLACE INTO ingested_files VALUES (?, ?)", (path, offset + end))
 
 
@@ -227,6 +233,57 @@ def ingest_session(db, transcript_path):
     ingest_file(db, transcript_path)
     for sub in glob.glob(os.path.join(transcript_path[:-len(".jsonl")], "subagents", "*.jsonl")):
         ingest_file(db, sub, os.path.basename(sub)[:-len(".jsonl")])
+
+
+def copied_from(transcript, sid):
+    """Other session ids tagged on a transcript's entries before its own first one. They are candidates only: a
+    session's own early requests can carry a stale id too."""
+    ids = set()
+    try:
+        with open(transcript, "rb") as f:
+            for line in f:
+                if b'"session_id"' not in line:
+                    continue
+                try:
+                    other = json.loads(line).get("session_id")
+                except ValueError:
+                    continue
+                if other == sid:
+                    break
+                if other:
+                    ids.add(other)
+    except OSError:
+        pass
+    return ids
+
+
+def carried_cost(db, sid, transcript):
+    """What a session's cost counter already held when it first appeared. Moving a conversation to a background
+    session gives it a new id but keeps the counter running; the parent's transcript then has a continued-in record
+    naming the new id, right after a cost-state with the counter at that moment. Later entries can follow it if the
+    parent is resumed, so this reads the whole file and takes the last cost-state before the record."""
+    for parent in copied_from(transcript, sid):
+        parent = os.path.basename(parent)
+        cost = None
+        try:
+            with open(os.path.join(os.path.dirname(transcript), parent + ".jsonl"), "rb") as f:
+                for line in f:
+                    if b'"type":"cost-state"' not in line and b'"type":"continued-in"' not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if e.get("type") == "cost-state":
+                        cost = e.get("totalCostUSD")
+                    elif e.get("type") == "continued-in" and e.get("continuedInSessionId") == sid:
+                        if cost is None:  # not every session writes cost-state
+                            row = db.execute("SELECT cost_raw_last FROM sessions WHERE session_id = ?", (parent,)).fetchone()
+                            cost = row and row[0]
+                        return float(cost or 0)
+        except OSError:
+            continue
+    return 0.0
 
 
 def window_tokens(v):
@@ -322,6 +379,12 @@ def record():
         prev = db.execute("SELECT cost_raw_last, cost_base, cost_usd FROM sessions WHERE session_id = ?", (sid,)).fetchone()
         raw_last, base, total_prev = prev if prev else (0.0, 0.0, 0.0)
         raw_last, base, total_prev = raw_last or 0.0, base or 0.0, total_prev or 0.0
+        tp = d.get("transcript_path")
+        tp = tp if tp and tp.endswith(".jsonl") else None
+        if not prev and tp:  # a handoff's counter starts at the parent's cost, which the parent already counted
+            carried = carried_cost(db, sid, tp)
+            if raw + 1e-9 >= carried:
+                base = -carried
         if raw < raw_last:  # counter restarted (e.g. resumed in a new process): keep what was already spent
             base += raw_last
         total = base + raw
@@ -364,14 +427,14 @@ def record():
                 INSERT INTO rate_limits (session_id, ts, five_hour_pct, five_hour_resets_at, seven_day_pct,
                                          seven_day_resets_at, account)
                 VALUES (?,?,?,?,?,?,?)""", (sid, ts, *limits, account))
-        tp = d.get("transcript_path")
-        if tp and tp.endswith(".jsonl"):
+        if tp:
             ingest_session(db, tp)
 
 
 def backfill():
     db = connect()
-    paths = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+    # Oldest first, so a request copied into a later transcript goes to the session it came from.
+    paths = sorted(glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")), key=os.path.getmtime)
     for p in paths:
         with db:
             ingest_session(db, p)

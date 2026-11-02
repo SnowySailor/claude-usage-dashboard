@@ -54,7 +54,7 @@ The database at `~/.claude/usage/` is kept. Delete it yourself if you want the d
 
 | Source | Data |
 |---|---|
-| Statusline JSON, on each refresh where the session cost changed | Session cost as Claude Code reports it (`cost.total_cost_usd`), duration, lines added/removed |
+| Statusline JSON, on each refresh where the session cost changed | Session cost as Claude Code reports it (`cost.total_cost_usd`), duration, lines added/removed. A conversation moved to a background session gets a new session ID but keeps its cost counter, so the new session's cost starts from what it spent itself. Its duration and line counts still include the earlier session's. |
 | Statusline JSON, on each refresh where the plan limits changed (Pro and Max plans only) | 5-hour and weekly limit use (`rate_limits.five_hour` / `seven_day`: percent used, reset time) |
 | Claude Code's global config (`~/.claude.json`), on the same refreshes | The account you are logged in to (account and organization IDs, email, organization name), so that the limits of different accounts stay apart. A session keeps its account until its weekly reset time moves to another schedule. |
 | Session transcripts (`~/.claude/projects/**.jsonl`), main thread and subagents | Per-request tokens: input, cache writes (5m / 1h), cache reads, output, thinking, web searches |
